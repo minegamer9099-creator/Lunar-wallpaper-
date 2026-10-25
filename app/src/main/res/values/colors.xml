@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="screen_background">#080E1D</color>
+    <color name="preview_background">#091023</color>
+    <color name="control_background">#111B31</color>
+    <color name="control_border">#273650</color>
+    <color name="text_primary">#F3F6FC</color>
+    <color name="text_secondary">#AAB7CC</color>
+    <color name="text_muted">#71809A</color>
+    <color name="accent">#78BDE8</color>
+    <color name="button_text">#081323</color>
+    <color name="icon_background">#101A32</color>
+</resources>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Luma Drift</string>
+    <string name="wallpaper_name">Luma Drift</string>
+    <string name="version_label">LIVE WALLPAPER · VERSION 1</string>
+    <string name="home_subtitle">A small, calm motion for your home screen. Designed to rest when you leave.</string>
+    <string name="preview_caption">Slow-moving light, drawn directly on the canvas. No downloads or image assets.</string>
+    <string name="animation_on">Animation on</string>
+    <string name="animation_off">Animation off</string>
+    <string name="set_wallpaper">Preview and apply wallpaper</string>
+    <string name="offline_note">OFFLINE BY DESIGN  ·  NO EXTRA PERMISSIONS</string>
+    <string name="preview_description">Preview of the Luma Drift animated wallpaper</string>
+    <string name="wallpaper_description">A lightweight, slowly moving field of light.</string>
+    <string name="wallpaper_picker_unavailable">This device does not provide the standard live wallpaper picker.</string>
+</resources>
