@@ -6,21 +6,35 @@ import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Intent
 import android.content.SharedPreferences
+import android.media.MediaMetadataRetriever
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.util.Log
 import android.view.View
 import android.widget.Button
+import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import android.widget.ToggleButton
+import android.widget.VideoView
 
 class HomeActivity : Activity() {
     private lateinit var preview: WallpaperPreviewView
     private lateinit var preferences: SharedPreferences
     private lateinit var selectedVideoLabel: TextView
     private lateinit var clearVideoButton: Button
+    private lateinit var videoPreview: VideoView
+    private lateinit var lockSplitSwitch: Switch
+    private lateinit var lockSegmentSeekBar: SeekBar
+    private lateinit var lockSegmentAmount: TextView
+    private var previewUri: Uri? = null
+    private var previewActive = false
+    private var previewFailed = false
+    private var metadataLoadingUri: Uri? = null
+    private var metadataAttemptedUri: Uri? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -33,6 +47,25 @@ class HomeActivity : Activity() {
         )
         selectedVideoLabel = findViewById(R.id.selectedVideoLabel)
         clearVideoButton = findViewById(R.id.clearVideoButton)
+        videoPreview = findViewById(R.id.videoPreview)
+        lockSplitSwitch = findViewById(R.id.lockSplitSwitch)
+        lockSegmentSeekBar = findViewById(R.id.lockSegmentSeekBar)
+        lockSegmentAmount = findViewById(R.id.lockSegmentAmount)
+
+        videoPreview.setOnPreparedListener { player ->
+            player.isLooping = true
+            player.setVolume(0f, 0f)
+            if (previewActive) videoPreview.start()
+        }
+        videoPreview.setOnErrorListener { _, _, _ ->
+            previewFailed = true
+            videoPreview.visibility = View.GONE
+            preview.visibility = View.VISIBLE
+            preview.setPreviewActive(previewActive)
+            findViewById<TextView>(R.id.previewCaption)
+                .setText(R.string.video_preview_unavailable)
+            true
+        }
 
         val animationToggle = findViewById<ToggleButton>(R.id.animationToggle)
         animationToggle.isChecked = preferences.getBoolean(
@@ -47,6 +80,49 @@ class HomeActivity : Activity() {
             preview.setAnimationEnabled(enabled)
         }
 
+        lockSplitSwitch.isChecked = preferences.getBoolean(
+            DriftWallpaperService.LOCK_SPLIT_ENABLED_KEY,
+            false
+        )
+        lockSplitSwitch.setOnCheckedChangeListener { _, enabled ->
+            preferences.edit()
+                .putBoolean(DriftWallpaperService.LOCK_SPLIT_ENABLED_KEY, enabled)
+                .apply()
+            updateLockPlaybackControls(
+                preferences.getString(DriftWallpaperService.VIDEO_URI_KEY, null)
+                    ?.let { Uri.parse(it) }
+            )
+        }
+        lockSegmentSeekBar.progress = preferences.getInt(
+            DriftWallpaperService.LOCK_SEGMENT_PERCENT_KEY,
+            DEFAULT_LOCK_SEGMENT_PERCENT
+        ).coerceIn(MIN_LOCK_SEGMENT_PERCENT, MAX_LOCK_SEGMENT_PERCENT)
+        lockSegmentSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                val safeProgress = progress.coerceIn(
+                    MIN_LOCK_SEGMENT_PERCENT,
+                    MAX_LOCK_SEGMENT_PERCENT
+                )
+                if (safeProgress != progress) seekBar?.progress = safeProgress
+                updateLockSegmentAmount()
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                preferences.edit()
+                    .putInt(
+                        DriftWallpaperService.LOCK_SEGMENT_PERCENT_KEY,
+                        lockSegmentSeekBar.progress.coerceIn(
+                            MIN_LOCK_SEGMENT_PERCENT,
+                            MAX_LOCK_SEGMENT_PERCENT
+                        )
+                    )
+                    .apply()
+            }
+        })
+
         findViewById<Button>(R.id.setWallpaperButton).setOnClickListener {
             openWallpaperPicker()
         }
@@ -58,7 +134,10 @@ class HomeActivity : Activity() {
             preferences.edit()
                 .remove(DriftWallpaperService.VIDEO_URI_KEY)
                 .remove(DriftWallpaperService.VIDEO_NAME_KEY)
+                .remove(DriftWallpaperService.VIDEO_DURATION_MS_KEY)
                 .apply()
+            metadataAttemptedUri = null
+            metadataLoadingUri = null
             refreshVideoSelection()
         }
 
@@ -68,11 +147,19 @@ class HomeActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        if (::preview.isInitialized) preview.setPreviewActive(true)
+        previewActive = true
+        if (::preview.isInitialized) {
+            preview.setPreviewActive(preview.visibility == View.VISIBLE)
+        }
+        if (::videoPreview.isInitialized && previewUri != null && !previewFailed) {
+            videoPreview.start()
+        }
     }
 
     override fun onPause() {
+        previewActive = false
         if (::preview.isInitialized) preview.setPreviewActive(false)
+        if (::videoPreview.isInitialized && previewUri != null) videoPreview.pause()
         super.onPause()
     }
 
@@ -147,7 +234,9 @@ class HomeActivity : Activity() {
         preferences.edit()
             .putString(DriftWallpaperService.VIDEO_URI_KEY, uri.toString())
             .putString(DriftWallpaperService.VIDEO_NAME_KEY, displayName)
+            .remove(DriftWallpaperService.VIDEO_DURATION_MS_KEY)
             .apply()
+        metadataAttemptedUri = null
         refreshVideoSelection()
         Toast.makeText(this, R.string.video_selected, Toast.LENGTH_SHORT).show()
     }
@@ -176,14 +265,150 @@ class HomeActivity : Activity() {
             selectedVideoLabel.setText(R.string.no_video_selected)
             clearVideoButton.visibility = View.GONE
             findViewById<TextView>(R.id.previewCaption).setText(R.string.preview_caption)
+            metadataAttemptedUri = null
+            metadataLoadingUri = null
+            syncVideoPreview(null)
+            updateLockPlaybackControls(null)
             return
         }
 
+        val uri = Uri.parse(videoUri)
+        syncVideoPreview(uri)
+        val durationMs = preferences.getLong(DriftWallpaperService.VIDEO_DURATION_MS_KEY, 0L)
+        if (durationMs <= 0L && metadataAttemptedUri != uri) {
+            loadVideoDuration(uri)
+        }
         val displayName = preferences.getString(DriftWallpaperService.VIDEO_NAME_KEY, null)
             ?: getString(R.string.selected_video_fallback)
         selectedVideoLabel.text = getString(R.string.selected_video_format, displayName)
         clearVideoButton.visibility = View.VISIBLE
         findViewById<TextView>(R.id.previewCaption).setText(R.string.video_preview_caption)
+        updateLockPlaybackControls(uri)
+    }
+
+    private fun syncVideoPreview(uri: Uri?) {
+        if (uri == null) {
+            if (previewUri != null) videoPreview.stopPlayback()
+            previewUri = null
+            previewFailed = false
+            videoPreview.visibility = View.GONE
+            preview.visibility = View.VISIBLE
+            preview.setPreviewActive(previewActive)
+            return
+        }
+
+        if (previewUri == uri && !previewFailed) {
+            videoPreview.visibility = View.VISIBLE
+            preview.visibility = View.GONE
+            preview.setPreviewActive(false)
+            return
+        }
+
+        videoPreview.stopPlayback()
+        previewUri = uri
+        previewFailed = false
+        preview.visibility = View.GONE
+        preview.setPreviewActive(false)
+        videoPreview.visibility = View.VISIBLE
+        videoPreview.setVideoURI(uri)
+    }
+
+    private fun loadVideoDuration(uri: Uri) {
+        metadataAttemptedUri = uri
+        metadataLoadingUri = uri
+        updateLockPlaybackControls(uri)
+
+        Thread({
+            var durationMs: Long? = null
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(this, uri)
+                durationMs = retriever.extractMetadata(
+                    MediaMetadataRetriever.METADATA_KEY_DURATION
+                )?.toLongOrNull()?.takeIf { it > 0L }
+            } catch (error: Exception) {
+                Log.w(TAG, "Could not read the selected video's duration", error)
+            } finally {
+                try {
+                    retriever.release()
+                } catch (error: RuntimeException) {
+                    Log.w(TAG, "Could not release the video metadata reader", error)
+                }
+            }
+
+            runOnUiThread {
+                if (isFinishing) return@runOnUiThread
+                val currentUri = preferences
+                    .getString(DriftWallpaperService.VIDEO_URI_KEY, null)
+                    ?.let { Uri.parse(it) }
+                if (currentUri != uri) return@runOnUiThread
+
+                metadataLoadingUri = null
+                durationMs?.let { loadedDuration ->
+                    preferences.edit()
+                        .putLong(DriftWallpaperService.VIDEO_DURATION_MS_KEY, loadedDuration)
+                        .apply()
+                }
+                updateLockPlaybackControls(uri)
+            }
+        }, "video-metadata-reader").start()
+    }
+
+    private fun updateLockPlaybackControls(uri: Uri?) {
+        val controls = findViewById<View>(R.id.lockPlaybackControls)
+        controls.visibility = if (uri == null) View.GONE else View.VISIBLE
+        if (uri == null) return
+
+        val durationMs = preferences.getLong(DriftWallpaperService.VIDEO_DURATION_MS_KEY, 0L)
+        val durationKnown = durationMs > 0L
+        val splitEnabled = preferences.getBoolean(
+            DriftWallpaperService.LOCK_SPLIT_ENABLED_KEY,
+            false
+        )
+        if (lockSplitSwitch.isChecked != splitEnabled) {
+            lockSplitSwitch.isChecked = splitEnabled
+        }
+        lockSplitSwitch.isEnabled = durationKnown
+        lockSegmentSeekBar.progress = preferences.getInt(
+            DriftWallpaperService.LOCK_SEGMENT_PERCENT_KEY,
+            DEFAULT_LOCK_SEGMENT_PERCENT
+        ).coerceIn(MIN_LOCK_SEGMENT_PERCENT, MAX_LOCK_SEGMENT_PERCENT)
+        lockSegmentSeekBar.isEnabled = durationKnown && splitEnabled
+
+        when {
+            durationKnown -> updateLockSegmentAmount()
+            metadataLoadingUri == uri -> lockSegmentAmount.setText(R.string.lock_segment_loading)
+            else -> lockSegmentAmount.setText(R.string.lock_segment_unknown)
+        }
+    }
+
+    private fun updateLockSegmentAmount() {
+        val durationMs = preferences.getLong(DriftWallpaperService.VIDEO_DURATION_MS_KEY, 0L)
+        if (durationMs <= 0L) return
+
+        val percent = lockSegmentSeekBar.progress.coerceIn(
+            MIN_LOCK_SEGMENT_PERCENT,
+            MAX_LOCK_SEGMENT_PERCENT
+        )
+        val lockDurationMs = (durationMs * percent / 100L).coerceAtLeast(1L)
+        lockSegmentAmount.text = getString(
+            R.string.lock_segment_amount,
+            formatDuration(lockDurationMs),
+            formatDuration(durationMs),
+            percent
+        )
+    }
+
+    private fun formatDuration(durationMs: Long): String {
+        val totalSeconds = ((durationMs + 999L) / 1_000L).coerceAtLeast(0L)
+        val seconds = totalSeconds % 60L
+        val minutes = (totalSeconds / 60L) % 60L
+        val hours = totalSeconds / 3_600L
+        return if (hours > 0L) {
+            "%d:%02d:%02d".format(hours, minutes, seconds)
+        } else {
+            "%02d:%02d".format(minutes, seconds)
+        }
     }
 
     private fun getDisplayName(uri: Uri): String {
@@ -210,5 +435,8 @@ class HomeActivity : Activity() {
     companion object {
         private const val REQUEST_VIDEO = 108
         private const val TAG = "LumaDriftHome"
+        private const val DEFAULT_LOCK_SEGMENT_PERCENT = 25
+        private const val MIN_LOCK_SEGMENT_PERCENT = 1
+        private const val MAX_LOCK_SEGMENT_PERCENT = 99
     }
 }
