@@ -1,9 +1,10 @@
 {
   "expo": {
-    "extra": {
-      "eas": {
-        "projectId": "bd97137e-5d31-49f2-9ebe-2c9b2e1c6484"
-      }
+    "name": "Lunar Wallpaper",
+    "slug": "lunar-wallpaper",
+    "version": "1.0.0",
+    "android": {
+      "package": "com.anurag.lunarwallpaper"
     }
   }
 }
