@@ -49,7 +49,7 @@ class DriftWallpaperService : WallpaperService() {
         private var failedVideoUri: Uri? = null
         private var videoPlayer: MediaPlayer? = null
         private var activeVideoUri: Uri? = null
-        private var resumePositionMs = 0
+        private var resumePositionMs = 0L
         private var lastKnownLocked: Boolean? = null
         private var playRemainderAfterUnlock = false
         private var lockSegmentComplete = false
@@ -179,12 +179,12 @@ class DriftWallpaperService : WallpaperService() {
                     if (nextUri != selectedVideoUri) {
                         selectedVideoUri = nextUri
                         if (nextUri != lastSelectedVideoUri) {
-                            resumePositionMs = 0
+                            resumePositionMs = 0L
                             failedVideoUri = null
                         }
                         lastSelectedVideoUri = nextUri
                         if (nextUri == null) {
-                            resumePositionMs = 0
+                            resumePositionMs = 0L
                             failedVideoUri = null
                         }
                         videoDurationMs = preferences.getLong(VIDEO_DURATION_MS_KEY, 0L)
@@ -374,7 +374,7 @@ class DriftWallpaperService : WallpaperService() {
                 isLocked && lastKnownLocked != true -> {
                     playRemainderAfterUnlock = false
                     lockSegmentComplete = false
-                    resumePositionMs = 0
+                    resumePositionMs = 0L
                     releaseVideoPlayer(savePosition = false)
                 }
                 !isLocked && lastKnownLocked == true -> {
@@ -391,7 +391,7 @@ class DriftWallpaperService : WallpaperService() {
             lastKnownLocked = null
             playRemainderAfterUnlock = false
             lockSegmentComplete = false
-            resumePositionMs = 0
+            resumePositionMs = 0L
             releaseVideoPlayer(savePosition = false)
         }
 
