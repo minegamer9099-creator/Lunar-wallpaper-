@@ -7,7 +7,6 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.SharedPreferences
 import android.media.MediaMetadataRetriever
-import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -94,15 +93,17 @@ class HomeActivity : Activity() {
             )
         }
         lockSegmentSeekBar.progress = preferences.getInt(
-            DriftWallpaperService.LOCK_SEGMENT_PERCENT_KEY,
-            DEFAULT_LOCK_SEGMENT_PERCENT
-        ).coerceIn(MIN_LOCK_SEGMENT_PERCENT, MAX_LOCK_SEGMENT_PERCENT)
+            DriftWallpaperService.LOCK_SEGMENT_SECONDS_KEY,
+            DEFAULT_LOCK_SEGMENT_SECONDS
+        ).coerceAtLeast(MIN_LOCK_SEGMENT_SECONDS)
         lockSegmentSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 if (!fromUser) return
                 val safeProgress = progress.coerceIn(
-                    MIN_LOCK_SEGMENT_PERCENT,
-                    MAX_LOCK_SEGMENT_PERCENT
+                    MIN_LOCK_SEGMENT_SECONDS,
+                    (seekBar?.max ?: MIN_LOCK_SEGMENT_SECONDS).coerceAtLeast(
+                        MIN_LOCK_SEGMENT_SECONDS
+                    )
                 )
                 if (safeProgress != progress) seekBar?.progress = safeProgress
                 updateLockSegmentAmount()
@@ -113,10 +114,10 @@ class HomeActivity : Activity() {
             override fun onStopTrackingTouch(seekBar: SeekBar?) {
                 preferences.edit()
                     .putInt(
-                        DriftWallpaperService.LOCK_SEGMENT_PERCENT_KEY,
+                        DriftWallpaperService.LOCK_SEGMENT_SECONDS_KEY,
                         lockSegmentSeekBar.progress.coerceIn(
-                            MIN_LOCK_SEGMENT_PERCENT,
-                            MAX_LOCK_SEGMENT_PERCENT
+                            MIN_LOCK_SEGMENT_SECONDS,
+                            lockSegmentSeekBar.max.coerceAtLeast(MIN_LOCK_SEGMENT_SECONDS)
                         )
                     )
                     .apply()
@@ -369,10 +370,27 @@ class HomeActivity : Activity() {
             lockSplitSwitch.isChecked = splitEnabled
         }
         lockSplitSwitch.isEnabled = durationKnown
-        lockSegmentSeekBar.progress = preferences.getInt(
-            DriftWallpaperService.LOCK_SEGMENT_PERCENT_KEY,
-            DEFAULT_LOCK_SEGMENT_PERCENT
-        ).coerceIn(MIN_LOCK_SEGMENT_PERCENT, MAX_LOCK_SEGMENT_PERCENT)
+        if (durationKnown) {
+            val maxSeconds = (durationMs / 1_000L)
+                .coerceAtLeast(MIN_LOCK_SEGMENT_SECONDS.toLong())
+                .coerceAtMost(Int.MAX_VALUE.toLong())
+                .toInt()
+            lockSegmentSeekBar.max = maxSeconds
+            val configuredSeconds = preferences.getInt(
+                DriftWallpaperService.LOCK_SEGMENT_SECONDS_KEY,
+                DEFAULT_LOCK_SEGMENT_SECONDS
+            )
+            val safeSeconds = configuredSeconds.coerceIn(
+                MIN_LOCK_SEGMENT_SECONDS,
+                maxSeconds
+            )
+            lockSegmentSeekBar.progress = safeSeconds
+            if (configuredSeconds != safeSeconds) {
+                preferences.edit()
+                    .putInt(DriftWallpaperService.LOCK_SEGMENT_SECONDS_KEY, safeSeconds)
+                    .apply()
+            }
+        }
         lockSegmentSeekBar.isEnabled = durationKnown && splitEnabled
 
         when {
@@ -386,29 +404,18 @@ class HomeActivity : Activity() {
         val durationMs = preferences.getLong(DriftWallpaperService.VIDEO_DURATION_MS_KEY, 0L)
         if (durationMs <= 0L) return
 
-        val percent = lockSegmentSeekBar.progress.coerceIn(
-            MIN_LOCK_SEGMENT_PERCENT,
-            MAX_LOCK_SEGMENT_PERCENT
+        val maxSeconds = (durationMs / 1_000L)
+            .coerceAtLeast(MIN_LOCK_SEGMENT_SECONDS.toLong())
+            .coerceAtMost(Int.MAX_VALUE.toLong())
+            .toInt()
+        val seconds = lockSegmentSeekBar.progress.coerceIn(
+            MIN_LOCK_SEGMENT_SECONDS,
+            maxSeconds
         )
-        val lockDurationMs = (durationMs * percent / 100L).coerceAtLeast(1L)
         lockSegmentAmount.text = getString(
             R.string.lock_segment_amount,
-            formatDuration(lockDurationMs),
-            formatDuration(durationMs),
-            percent
+            seconds
         )
-    }
-
-    private fun formatDuration(durationMs: Long): String {
-        val totalSeconds = ((durationMs + 999L) / 1_000L).coerceAtLeast(0L)
-        val seconds = totalSeconds % 60L
-        val minutes = (totalSeconds / 60L) % 60L
-        val hours = totalSeconds / 3_600L
-        return if (hours > 0L) {
-            "%d:%02d:%02d".format(hours, minutes, seconds)
-        } else {
-            "%02d:%02d".format(minutes, seconds)
-        }
     }
 
     private fun getDisplayName(uri: Uri): String {
@@ -435,8 +442,7 @@ class HomeActivity : Activity() {
     companion object {
         private const val REQUEST_VIDEO = 108
         private const val TAG = "LumaDriftHome"
-        private const val DEFAULT_LOCK_SEGMENT_PERCENT = 25
-        private const val MIN_LOCK_SEGMENT_PERCENT = 1
-        private const val MAX_LOCK_SEGMENT_PERCENT = 99
+        private const val DEFAULT_LOCK_SEGMENT_SECONDS = 5
+        private const val MIN_LOCK_SEGMENT_SECONDS = 1
     }
 }

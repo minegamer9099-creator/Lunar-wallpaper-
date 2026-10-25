@@ -37,10 +37,10 @@ class DriftWallpaperService : WallpaperService() {
         private var destroyed = false
         private var animationEnabled = preferences.getBoolean(ANIMATION_ENABLED_KEY, true)
         private var lockSplitEnabled = preferences.getBoolean(LOCK_SPLIT_ENABLED_KEY, false)
-        private var lockSegmentPercent = preferences.getInt(
-            LOCK_SEGMENT_PERCENT_KEY,
-            DEFAULT_LOCK_SEGMENT_PERCENT
-        ).coerceIn(MIN_LOCK_SEGMENT_PERCENT, MAX_LOCK_SEGMENT_PERCENT)
+        private var lockSegmentSeconds = preferences.getInt(
+            LOCK_SEGMENT_SECONDS_KEY,
+            DEFAULT_LOCK_SEGMENT_SECONDS
+        ).coerceAtLeast(MIN_LOCK_SEGMENT_SECONDS)
         private var videoDurationMs = preferences.getLong(VIDEO_DURATION_MS_KEY, 0L)
         private var surfaceWidth = 0
         private var surfaceHeight = 0
@@ -69,27 +69,24 @@ class DriftWallpaperService : WallpaperService() {
         private val lockSegmentBoundaryCheck = object : Runnable {
             override fun run() {
                 val player = videoPlayer ?: return
-                if (!canDraw() || !lockSplitEnabled || !keyguardManager.isKeyguardLocked) return
+                if (!canDraw() || !lockSplitEnabled) return
+                if (!keyguardManager.isKeyguardLocked) {
+                    updateRendering()
+                    return
+                }
 
                 val segmentEndMs = activeLockedSegmentEndMs
                 if (segmentEndMs <= 0L) return
 
                 try {
-                    if (!player.isPlaying) return
-                    if (player.currentPosition.toLong() >= segmentEndMs) {
-                        player.pause()
-                        seekTo(player, segmentEndMs)
-                        resumePositionMs = segmentEndMs
-                        lockSegmentComplete = true
-                        activeLockedSegmentEndMs = 0L
-                        return
-                    }
+                    if (player.isPlaying) player.pause()
                 } catch (error: IllegalStateException) {
-                    Log.w(TAG, "Could not check the lock-screen video position", error)
-                    return
+                    Log.w(TAG, "Could not pause the video at the lock-screen limit", error)
                 }
 
-                handler.postDelayed(this, LOCK_BOUNDARY_CHECK_INTERVAL_MS)
+                resumePositionMs = segmentEndMs
+                lockSegmentComplete = true
+                activeLockedSegmentEndMs = 0L
             }
         }
 
@@ -204,11 +201,11 @@ class DriftWallpaperService : WallpaperService() {
                     resetSplitPlaybackForPreferenceChange()
                     updateRendering()
                 }
-                LOCK_SEGMENT_PERCENT_KEY -> {
-                    lockSegmentPercent = preferences.getInt(
-                        LOCK_SEGMENT_PERCENT_KEY,
-                        DEFAULT_LOCK_SEGMENT_PERCENT
-                    ).coerceIn(MIN_LOCK_SEGMENT_PERCENT, MAX_LOCK_SEGMENT_PERCENT)
+                LOCK_SEGMENT_SECONDS_KEY -> {
+                    lockSegmentSeconds = preferences.getInt(
+                        LOCK_SEGMENT_SECONDS_KEY,
+                        DEFAULT_LOCK_SEGMENT_SECONDS
+                    ).coerceAtLeast(MIN_LOCK_SEGMENT_SECONDS)
                     resetSplitPlaybackForPreferenceChange()
                     updateRendering()
                 }
@@ -220,7 +217,6 @@ class DriftWallpaperService : WallpaperService() {
 
         private fun updateRendering() {
             handler.removeCallbacks(frame)
-            handler.removeCallbacks(lockSegmentBoundaryCheck)
             synchronizeLockState()
             if (!canDraw()) {
                 releaseVideoPlayer(savePosition = true)
@@ -304,7 +300,7 @@ class DriftWallpaperService : WallpaperService() {
                             handler.removeCallbacks(lockSegmentBoundaryCheck)
                             handler.postDelayed(
                                 lockSegmentBoundaryCheck,
-                                LOCK_BOUNDARY_CHECK_INTERVAL_MS
+                                (segmentEndMs - startPositionMs).coerceAtLeast(1L)
                             )
                         }
                     } catch (error: IllegalStateException) {
@@ -321,6 +317,7 @@ class DriftWallpaperService : WallpaperService() {
                     try {
                         val isLocked = keyguardManager.isKeyguardLocked
                         if (lockSplitEnabled && isLocked) {
+                            handler.removeCallbacks(lockSegmentBoundaryCheck)
                             lockSegmentComplete = true
                             resumePositionMs = lockBoundaryMs()
                             activeLockedSegmentEndMs = 0L
@@ -397,8 +394,10 @@ class DriftWallpaperService : WallpaperService() {
 
         private fun lockBoundaryMs(): Long {
             if (videoDurationMs <= 0L) return 0L
-            return (videoDurationMs * lockSegmentPercent / 100L)
-                .coerceIn(1L, videoDurationMs)
+            val requestedDurationMs = lockSegmentSeconds
+                .coerceAtLeast(MIN_LOCK_SEGMENT_SECONDS)
+                .toLong() * MILLISECONDS_PER_SECOND
+            return requestedDurationMs.coerceAtMost(videoDurationMs)
         }
 
         private fun seekTo(player: MediaPlayer, positionMs: Long) {
@@ -525,13 +524,12 @@ class DriftWallpaperService : WallpaperService() {
         const val VIDEO_NAME_KEY = "selected_video_name"
         const val VIDEO_DURATION_MS_KEY = "selected_video_duration_ms"
         const val LOCK_SPLIT_ENABLED_KEY = "lock_split_enabled"
-        const val LOCK_SEGMENT_PERCENT_KEY = "lock_segment_percent"
+        const val LOCK_SEGMENT_SECONDS_KEY = "lock_segment_seconds"
 
         private const val TAG = "LumaDrift"
         private const val FRAME_INTERVAL_MS = 1_000L / 24L
-        private const val LOCK_BOUNDARY_CHECK_INTERVAL_MS = 100L
-        private const val DEFAULT_LOCK_SEGMENT_PERCENT = 25
-        private const val MIN_LOCK_SEGMENT_PERCENT = 1
-        private const val MAX_LOCK_SEGMENT_PERCENT = 99
+        private const val MILLISECONDS_PER_SECOND = 1_000L
+        private const val DEFAULT_LOCK_SEGMENT_SECONDS = 5
+        private const val MIN_LOCK_SEGMENT_SECONDS = 1
     }
 }
