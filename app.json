@@ -3,8 +3,14 @@
     "name": "Lunar Wallpaper",
     "slug": "lunar-wallpaper",
     "version": "1.0.0",
+    "owner": "anurag2222s-team",
     "android": {
       "package": "com.anurag.lunarwallpaper"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "bd97137e-5d31-49f2-9ebe-2c9b2e1c6484"
+      }
     }
   }
 }
