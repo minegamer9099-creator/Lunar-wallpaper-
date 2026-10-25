@@ -5,7 +5,12 @@ import android.app.WallpaperManager
 import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Intent
+import android.content.SharedPreferences
+import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
+import android.util.Log
+import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -13,18 +18,23 @@ import android.widget.ToggleButton
 
 class HomeActivity : Activity() {
     private lateinit var preview: WallpaperPreviewView
+    private lateinit var preferences: SharedPreferences
+    private lateinit var selectedVideoLabel: TextView
+    private lateinit var clearVideoButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         preview = findViewById(R.id.wallpaperPreview)
-
-        val animationToggle = findViewById<ToggleButton>(R.id.animationToggle)
-        val preferences = getSharedPreferences(
+        preferences = getSharedPreferences(
             DriftWallpaperService.PREFERENCES_NAME,
             MODE_PRIVATE
         )
+        selectedVideoLabel = findViewById(R.id.selectedVideoLabel)
+        clearVideoButton = findViewById(R.id.clearVideoButton)
+
+        val animationToggle = findViewById<ToggleButton>(R.id.animationToggle)
         animationToggle.isChecked = preferences.getBoolean(
             DriftWallpaperService.ANIMATION_ENABLED_KEY,
             true
@@ -40,8 +50,20 @@ class HomeActivity : Activity() {
         findViewById<Button>(R.id.setWallpaperButton).setOnClickListener {
             openWallpaperPicker()
         }
+        findViewById<Button>(R.id.chooseVideoButton).setOnClickListener {
+            chooseVideo()
+        }
+        clearVideoButton.setOnClickListener {
+            releaseStoredVideoGrant()
+            preferences.edit()
+                .remove(DriftWallpaperService.VIDEO_URI_KEY)
+                .remove(DriftWallpaperService.VIDEO_NAME_KEY)
+                .apply()
+            refreshVideoSelection()
+        }
 
         findViewById<TextView>(R.id.versionLabel).text = getString(R.string.version_label)
+        refreshVideoSelection()
     }
 
     override fun onResume() {
@@ -75,5 +97,118 @@ class HomeActivity : Activity() {
                 ).show()
             }
         }
+    }
+
+    private fun chooseVideo() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "video/*"
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
+        }
+
+        try {
+            startActivityForResult(intent, REQUEST_VIDEO)
+        } catch (error: ActivityNotFoundException) {
+            Toast.makeText(this, R.string.video_picker_unavailable, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    @Deprecated("Uses the platform document picker without adding an AndroidX dependency.")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_VIDEO || resultCode != RESULT_OK) return
+
+        val resultIntent = data ?: return
+        val uri = resultIntent.data ?: return
+        val grantedReadFlags =
+            resultIntent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+        if (grantedReadFlags == 0) {
+            Toast.makeText(this, R.string.video_access_unavailable, Toast.LENGTH_LONG).show()
+            return
+        }
+
+        try {
+            contentResolver.takePersistableUriPermission(uri, grantedReadFlags)
+        } catch (error: SecurityException) {
+            Log.w(TAG, "The selected video provider did not grant persistent read access", error)
+            Toast.makeText(this, R.string.video_access_unavailable, Toast.LENGTH_LONG).show()
+            return
+        } catch (error: IllegalArgumentException) {
+            Log.w(TAG, "The selected video provider does not support persistent access", error)
+            Toast.makeText(this, R.string.video_access_unavailable, Toast.LENGTH_LONG).show()
+            return
+        }
+
+        releaseStoredVideoGrant(except = uri)
+        val displayName = getDisplayName(uri)
+        preferences.edit()
+            .putString(DriftWallpaperService.VIDEO_URI_KEY, uri.toString())
+            .putString(DriftWallpaperService.VIDEO_NAME_KEY, displayName)
+            .apply()
+        refreshVideoSelection()
+        Toast.makeText(this, R.string.video_selected, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun releaseStoredVideoGrant(except: Uri? = null) {
+        val storedVideo = preferences.getString(DriftWallpaperService.VIDEO_URI_KEY, null)
+            ?: return
+        val storedUri = Uri.parse(storedVideo)
+        if (storedUri == except) return
+
+        try {
+            contentResolver.releasePersistableUriPermission(
+                storedUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (error: SecurityException) {
+            Log.w(TAG, "Could not release the previous video access grant", error)
+        } catch (error: IllegalArgumentException) {
+            Log.w(TAG, "The previous video access grant was already released", error)
+        }
+    }
+
+    private fun refreshVideoSelection() {
+        val videoUri = preferences.getString(DriftWallpaperService.VIDEO_URI_KEY, null)
+        if (videoUri.isNullOrBlank()) {
+            selectedVideoLabel.setText(R.string.no_video_selected)
+            clearVideoButton.visibility = View.GONE
+            findViewById<TextView>(R.id.previewCaption).setText(R.string.preview_caption)
+            return
+        }
+
+        val displayName = preferences.getString(DriftWallpaperService.VIDEO_NAME_KEY, null)
+            ?: getString(R.string.selected_video_fallback)
+        selectedVideoLabel.text = getString(R.string.selected_video_format, displayName)
+        clearVideoButton.visibility = View.VISIBLE
+        findViewById<TextView>(R.id.previewCaption).setText(R.string.video_preview_caption)
+    }
+
+    private fun getDisplayName(uri: Uri): String {
+        try {
+            contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                val nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (cursor.moveToFirst() && nameColumn >= 0) {
+                    cursor.getString(nameColumn)?.let { return it }
+                }
+            }
+        } catch (error: RuntimeException) {
+            Log.w(TAG, "Could not read the selected video's display name", error)
+        }
+        return uri.lastPathSegment?.substringAfterLast('/')
+            ?: getString(R.string.selected_video_fallback)
+    }
+
+    companion object {
+        private const val REQUEST_VIDEO = 108
+        private const val TAG = "LumaDriftHome"
     }
 }

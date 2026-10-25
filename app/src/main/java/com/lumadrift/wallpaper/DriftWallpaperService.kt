@@ -3,6 +3,8 @@ package com.lumadrift.wallpaper
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.media.MediaPlayer
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -28,6 +30,12 @@ class DriftWallpaperService : WallpaperService() {
         private var animationEnabled = preferences.getBoolean(ANIMATION_ENABLED_KEY, true)
         private var surfaceWidth = 0
         private var surfaceHeight = 0
+        private var selectedVideoUri = readSelectedVideoUri()
+        private var lastSelectedVideoUri = selectedVideoUri
+        private var failedVideoUri: Uri? = null
+        private var videoPlayer: MediaPlayer? = null
+        private var activeVideoUri: Uri? = null
+        private var resumePositionMs = 0
 
         private val frame = object : Runnable {
             override fun run() {
@@ -66,12 +74,14 @@ class DriftWallpaperService : WallpaperService() {
         override fun onSurfaceDestroyed(holder: SurfaceHolder) {
             surfaceAvailable = false
             handler.removeCallbacks(frame)
+            releaseVideoPlayer(savePosition = true)
             super.onSurfaceDestroyed(holder)
         }
 
         override fun onDestroy() {
             destroyed = true
             handler.removeCallbacks(frame)
+            releaseVideoPlayer(savePosition = false)
             preferences.unregisterOnSharedPreferenceChangeListener(this)
             super.onDestroy()
         }
@@ -80,9 +90,27 @@ class DriftWallpaperService : WallpaperService() {
             sharedPreferences: android.content.SharedPreferences?,
             key: String?
         ) {
-            if (key == ANIMATION_ENABLED_KEY) {
-                animationEnabled = preferences.getBoolean(ANIMATION_ENABLED_KEY, true)
-                updateRendering()
+            when (key) {
+                ANIMATION_ENABLED_KEY -> {
+                    animationEnabled = preferences.getBoolean(ANIMATION_ENABLED_KEY, true)
+                    updateRendering()
+                }
+                VIDEO_URI_KEY -> {
+                    val nextUri = readSelectedVideoUri()
+                    if (nextUri != selectedVideoUri) {
+                        selectedVideoUri = nextUri
+                        if (nextUri != lastSelectedVideoUri) {
+                            resumePositionMs = 0
+                            failedVideoUri = null
+                        }
+                        lastSelectedVideoUri = nextUri
+                        if (nextUri == null) {
+                            resumePositionMs = 0
+                            failedVideoUri = null
+                        }
+                    }
+                    updateRendering()
+                }
             }
         }
 
@@ -91,13 +119,121 @@ class DriftWallpaperService : WallpaperService() {
 
         private fun updateRendering() {
             handler.removeCallbacks(frame)
-            if (!canDraw()) return
+            if (!canDraw()) {
+                releaseVideoPlayer(savePosition = true)
+                return
+            }
 
+            val videoUri = selectedVideoUri
+            if (videoUri != null && videoUri != failedVideoUri) {
+                if (activeVideoUri == videoUri && videoPlayer != null) return
+                if (videoPlayer != null) releaseVideoPlayer(savePosition = false)
+                startVideoPlayer(videoUri)
+                return
+            }
+
+            releaseVideoPlayer(savePosition = false)
             drawFrame()
             if (animationEnabled) {
                 handler.postDelayed(frame, FRAME_INTERVAL_MS)
             }
         }
+
+        private fun startVideoPlayer(uri: Uri) {
+            if (!canDraw()) return
+
+            val player = try {
+                MediaPlayer()
+            } catch (error: RuntimeException) {
+                handleVideoFailure(uri, null, "Could not create the video player", error)
+                return
+            }
+
+            videoPlayer = player
+            activeVideoUri = uri
+            try {
+                player.setDataSource(this@DriftWallpaperService, uri)
+                player.setSurface(surfaceHolder.surface)
+                player.setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
+                player.isLooping = true
+                player.setVolume(0f, 0f)
+                player.setOnPreparedListener { preparedPlayer ->
+                    if (
+                        videoPlayer !== preparedPlayer ||
+                        !canDraw() ||
+                        selectedVideoUri != uri
+                    ) {
+                        if (videoPlayer === preparedPlayer) {
+                            releaseVideoPlayer(savePosition = false)
+                        }
+                        return@setOnPreparedListener
+                    }
+
+                    try {
+                        if (resumePositionMs > 0) preparedPlayer.seekTo(resumePositionMs)
+                        preparedPlayer.start()
+                    } catch (error: IllegalStateException) {
+                        handleVideoFailure(
+                            uri,
+                            preparedPlayer,
+                            "Could not start the selected wallpaper video",
+                            error
+                        )
+                    }
+                }
+                player.setOnErrorListener { failedPlayer, what, extra ->
+                    handleVideoFailure(
+                        uri,
+                        failedPlayer,
+                        "Video playback failed (what=$what, extra=$extra)",
+                        null
+                    )
+                    true
+                }
+                player.prepareAsync()
+            } catch (error: Exception) {
+                handleVideoFailure(uri, player, "Could not prepare the selected wallpaper video", error)
+            }
+        }
+
+        private fun handleVideoFailure(
+            uri: Uri,
+            player: MediaPlayer?,
+            message: String,
+            error: Throwable?
+        ) {
+            if (player != null && videoPlayer !== player) return
+            failedVideoUri = uri
+            if (error == null) {
+                Log.e(TAG, "$message; using the built-in wallpaper instead")
+            } else {
+                Log.e(TAG, "$message; using the built-in wallpaper instead", error)
+            }
+            releaseVideoPlayer(savePosition = false)
+            updateRendering()
+        }
+
+        private fun releaseVideoPlayer(savePosition: Boolean) {
+            val player = videoPlayer ?: return
+            if (savePosition && activeVideoUri == selectedVideoUri) {
+                try {
+                    resumePositionMs = player.currentPosition
+                } catch (_: IllegalStateException) {
+                    // Keep the last known position if preparation had not completed.
+                }
+            }
+
+            videoPlayer = null
+            activeVideoUri = null
+            try {
+                player.release()
+            } catch (error: RuntimeException) {
+                Log.w(TAG, "Could not release the video player cleanly", error)
+            }
+        }
+
+        private fun readSelectedVideoUri(): Uri? =
+            preferences.getString(VIDEO_URI_KEY, null)?.let { Uri.parse(it) }
 
         private fun drawFrame() {
             if (!canDraw()) return
@@ -162,6 +298,8 @@ class DriftWallpaperService : WallpaperService() {
     companion object {
         const val PREFERENCES_NAME = "wallpaper_settings"
         const val ANIMATION_ENABLED_KEY = "animation_enabled"
+        const val VIDEO_URI_KEY = "selected_video_uri"
+        const val VIDEO_NAME_KEY = "selected_video_name"
 
         private const val TAG = "LumaDrift"
         private const val FRAME_INTERVAL_MS = 1_000L / 24L

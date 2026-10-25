@@ -5,11 +5,22 @@
     <string name="version_label">LIVE WALLPAPER · VERSION 1</string>
     <string name="home_subtitle">A small, calm motion for your home screen. Designed to rest when you leave.</string>
     <string name="preview_caption">Slow-moving light, drawn directly on the canvas. No downloads or image assets.</string>
-    <string name="animation_on">Animation on</string>
-    <string name="animation_off">Animation off</string>
+    <string name="video_preview_caption">The selected clip appears in Android’s wallpaper preview. Video audio is always muted.</string>
+    <string name="video_section_title">Use a video from your device</string>
+    <string name="no_video_selected">No video selected. Luma Drift’s built-in wallpaper will be used.</string>
+    <string name="selected_video_fallback">Selected video</string>
+    <string name="selected_video_format">Selected: %1$s</string>
+    <string name="video_resolution_note">Any resolution is allowed. High-resolution videos may stutter or fail on some phones.</string>
+    <string name="choose_video">Choose video from this device</string>
+    <string name="use_default_wallpaper">Use built-in Luma Drift wallpaper</string>
+    <string name="animation_on">Built-in animation on</string>
+    <string name="animation_off">Built-in animation off</string>
     <string name="set_wallpaper">Preview and apply wallpaper</string>
-    <string name="offline_note">OFFLINE BY DESIGN  ·  NO EXTRA PERMISSIONS</string>
+    <string name="offline_note">OFFLINE BY DESIGN  ·  VIDEO AUDIO MUTED</string>
     <string name="preview_description">Preview of the Luma Drift animated wallpaper</string>
-    <string name="wallpaper_description">A lightweight, slowly moving field of light.</string>
+    <string name="wallpaper_description">A lightweight animated wallpaper with optional device video playback.</string>
     <string name="wallpaper_picker_unavailable">This device does not provide the standard live wallpaper picker.</string>
+    <string name="video_picker_unavailable">This device does not provide a video file picker.</string>
+    <string name="video_access_unavailable">This video source cannot grant lasting access. Choose a video from Gallery or Files.</string>
+    <string name="video_selected">Video selected for wallpaper preview.</string>
 </resources>
