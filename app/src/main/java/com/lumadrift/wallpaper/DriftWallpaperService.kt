@@ -49,6 +49,7 @@ class DriftWallpaperService : WallpaperService() {
         private var failedVideoUri: Uri? = null
         private var videoPlayer: MediaPlayer? = null
         private var activeVideoUri: Uri? = null
+        private var videoSurfaceAttached = false
         private var resumePositionMs = preferences
             .getLong(VIDEO_RESUME_POSITION_MS_KEY, 0L)
             .coerceAtLeast(0L)
@@ -68,6 +69,12 @@ class DriftWallpaperService : WallpaperService() {
         private var lockTimerPlayer: MediaPlayer? = null
         private var lockTimerGeneration = 0L
         private var scheduledLockTimerGeneration = 0L
+
+        private val deferredVideoRelease = Runnable {
+            if (!canDraw() && screenIsOn && !keyguardManager.isKeyguardLocked) {
+                releaseVideoPlayer(savePosition = !resetLockPositionUntilStarted)
+            }
+        }
 
         private val frame = object : Runnable {
             override fun run() {
@@ -210,14 +217,15 @@ class DriftWallpaperService : WallpaperService() {
             surfaceAvailable = false
             synchronizeLockState()
             handler.removeCallbacks(frame)
-            cancelLockPauseTimer()
-            releaseVideoPlayer(savePosition = true)
+            pauseVideoPlayerForTransition(detachSurface = true)
+            scheduleDeferredVideoReleaseIfNeeded()
             super.onSurfaceDestroyed(holder)
         }
 
         override fun onDestroy() {
             destroyed = true
             handler.removeCallbacks(frame)
+            handler.removeCallbacks(deferredVideoRelease)
             cancelLockPauseTimer()
             releaseVideoPlayer(savePosition = !resetLockPositionUntilStarted)
             if (receiverRegistered) {
@@ -285,15 +293,28 @@ class DriftWallpaperService : WallpaperService() {
 
         private fun updateRendering() {
             handler.removeCallbacks(frame)
+            handler.removeCallbacks(deferredVideoRelease)
             synchronizeLockState()
             if (!canDraw() || !screenIsOn) {
-                releaseVideoPlayer(savePosition = !resetLockPositionUntilStarted)
+                pauseVideoPlayerForTransition(detachSurface = !surfaceAvailable)
+                scheduleDeferredVideoReleaseIfNeeded()
                 return
             }
 
             val videoUri = selectedVideoUri
             if (videoUri != null && videoUri != failedVideoUri) {
-                if (activeVideoUri == videoUri && videoPlayer != null) return
+                if (activeVideoUri == videoUri && videoPlayer != null) {
+                    val player = videoPlayer ?: return
+                    if (!attachVideoSurface(player)) return
+                    if (playerPrepared && !isPlayerPlaying(player)) {
+                        requestPlaybackPosition(
+                            player,
+                            resumePositionMs,
+                            shouldStart = true
+                        )
+                    }
+                    return
+                }
                 if (videoPlayer != null) releaseVideoPlayer(savePosition = false)
                 startVideoPlayer(videoUri)
                 return
@@ -304,6 +325,68 @@ class DriftWallpaperService : WallpaperService() {
             if (animationEnabled) {
                 handler.postDelayed(frame, FRAME_INTERVAL_MS)
             }
+        }
+
+        private fun pauseVideoPlayerForTransition(detachSurface: Boolean) {
+            cancelLockPauseTimer()
+            val player = videoPlayer ?: return
+
+            if (playerPrepared) {
+                try {
+                    if (
+                        !resetLockPositionUntilStarted &&
+                        activeVideoUri == selectedVideoUri
+                    ) {
+                        val currentPositionMs = player.currentPosition.toLong()
+                        val lockSegmentEnd = activeLockedSegmentEndMs
+                        if (lockSegmentEnd > 0L && currentPositionMs >= lockSegmentEnd) {
+                            resumePositionMs = lockSegmentEnd
+                            lockSegmentComplete = true
+                        } else {
+                            resumePositionMs = currentPositionMs
+                        }
+                        persistResumePosition(resumePositionMs)
+                    }
+                    if (player.isPlaying) player.pause()
+                } catch (_: IllegalStateException) {
+                    // Keep the last known position while Android changes wallpaper surfaces.
+                }
+            }
+
+            if (detachSurface && videoSurfaceAttached) {
+                try {
+                    player.setSurface(null)
+                } catch (error: RuntimeException) {
+                    Log.w(TAG, "Could not detach the wallpaper surface during a transition", error)
+                } finally {
+                    videoSurfaceAttached = false
+                }
+            }
+        }
+
+        private fun attachVideoSurface(player: MediaPlayer): Boolean {
+            if (videoSurfaceAttached) return true
+            val surface = surfaceHolder.surface
+            if (!surface.isValid) return false
+
+            return try {
+                player.setSurface(surface)
+                videoSurfaceAttached = true
+                true
+            } catch (error: RuntimeException) {
+                Log.w(TAG, "Could not attach the wallpaper surface to the video player", error)
+                false
+            }
+        }
+
+        private fun scheduleDeferredVideoReleaseIfNeeded() {
+            if (
+                videoPlayer == null ||
+                !screenIsOn ||
+                keyguardManager.isKeyguardLocked
+            ) return
+            handler.removeCallbacks(deferredVideoRelease)
+            handler.postDelayed(deferredVideoRelease, VIDEO_PLAYER_RELEASE_DELAY_MS)
         }
 
         private fun startVideoPlayer(uri: Uri) {
@@ -325,13 +408,13 @@ class DriftWallpaperService : WallpaperService() {
             try {
                 player.setDataSource(this@DriftWallpaperService, uri)
                 player.setSurface(surfaceHolder.surface)
+                videoSurfaceAttached = true
                 player.setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
                 player.isLooping = false
                 player.setVolume(0f, 0f)
                 player.setOnPreparedListener { preparedPlayer ->
                     if (
                         videoPlayer !== preparedPlayer ||
-                        !canDraw() ||
                         selectedVideoUri != uri
                     ) {
                         if (videoPlayer === preparedPlayer) {
@@ -340,11 +423,12 @@ class DriftWallpaperService : WallpaperService() {
                         return@setOnPreparedListener
                     }
 
-                    try {
-                        playerPrepared = true
-                        val actualDurationMs = preparedPlayer.duration.toLong()
-                        if (actualDurationMs > 0L) videoDurationMs = actualDurationMs
+                    playerPrepared = true
+                    val actualDurationMs = preparedPlayer.duration.toLong()
+                    if (actualDurationMs > 0L) videoDurationMs = actualDurationMs
+                    if (!canDraw() || !screenIsOn) return@setOnPreparedListener
 
+                    try {
                         synchronizeLockState()
                         val isLocked = keyguardManager.isKeyguardLocked
                         val lockSegmentActive =
@@ -735,6 +819,7 @@ class DriftWallpaperService : WallpaperService() {
         }
 
         private fun releaseVideoPlayer(savePosition: Boolean) {
+            handler.removeCallbacks(deferredVideoRelease)
             cancelLockPauseTimer()
             val player = videoPlayer ?: return
             if (
@@ -759,6 +844,7 @@ class DriftWallpaperService : WallpaperService() {
 
             videoPlayer = null
             activeVideoUri = null
+            videoSurfaceAttached = false
             activeLockedSegmentEndMs = 0L
             playerPrepared = false
             seekInFlight = false
@@ -853,6 +939,7 @@ class DriftWallpaperService : WallpaperService() {
 
         private const val TAG = "LumaDrift"
         private const val FRAME_INTERVAL_MS = 1_000L / 24L
+        private const val VIDEO_PLAYER_RELEASE_DELAY_MS = 5_000L
         private const val MILLISECONDS_PER_TENTH = 100L
         private const val DEFAULT_LOCK_SEGMENT_TENTHS = 50
         private const val MIN_LOCK_SEGMENT_TENTHS = 1

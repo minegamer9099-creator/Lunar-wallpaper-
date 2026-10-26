@@ -39,7 +39,7 @@ The unsigned release APK is written to `app/build/outputs/apk/release/app-releas
 - `DriftWallpaperService` is a standard `WallpaperService` with a custom `Engine`.
 - The built-in wallpaper uses a reusable pair of `Paint` objects and basic Canvas shapes; it does not load bitmaps, run network calls, use a background thread, or use a foreground service.
 - Local videos can be selected through Android's system document picker. The app stores the selected content URI and its persistent read grant; it does not request broad gallery/storage permissions or copy the video.
-- Selected videos are muted and looped with Android `MediaPlayer` directly on the wallpaper surface. The same prepared player is kept across lock/unlock transitions; it is released when the wallpaper becomes invisible or the surface/engine is destroyed, and recreated only when needed.
+- Selected videos are muted and looped with Android `MediaPlayer` directly on the wallpaper surface. The prepared player is paused and retained across screen-off and wallpaper-surface handoffs, then attached to the new surface on resume to avoid decoding the video again during unlock. If the wallpaper stays hidden while the device is unlocked, the player is released after a 5-second grace period; it is always released when the engine is destroyed.
 - The app screen replaces its built-in drawing preview with a muted, looping preview of the selected video.
 - Optional lock-screen splitting lets the user choose a duration in 0.1-second increments. The service uses one cancellable, one-shot pause timer rather than periodic position polling. It resets the lock segment on screen-off, starts it once when the lock screen returns, and reuses the prepared player on unlock so playback continues from the paused position. The chosen duration is saved, and old whole-second settings are migrated. Android may not expose the lock-screen wallpaper surface on every version or manufacturer; the wallpaper picker and OEM keyguard behavior remain device-dependent.
 - Any video resolution is accepted. Playback relies on the device's decoder; high-resolution or unsupported videos may stutter or fail on entry-level phones. On playback failure, the service logs the error and falls back to the built-in wallpaper.
@@ -52,10 +52,10 @@ The 20–30 MB process-memory objective is not a guaranteed cap. Measure Java/Ko
 
 ## Test record
 
-Environment checks performed for this delivery:
+Environment checks performed for this update:
 
-- Source and resource files reviewed for the required wallpaper declaration, offline operation, and visibility-based frame scheduling.
-- The Gradle wrapper was generated and downloaded Gradle 8.7 successfully.
-- `assembleDebug` was attempted but stopped before compilation because no Android SDK is installed in the build environment.
+- Source-level checks confirmed that screen-off and surface transitions pause and retain the prepared player, that a returning surface is reattached, and that an unlocked hidden wallpaper releases the player after the 5-second grace period.
+- `AndroidManifest.xml` parses successfully.
+- `assembleDebug` could not start because this environment has no Java/JDK installed.
 
-**NOT TESTED:** Android source compilation, APK installation, video selection and persistent URI access, video codec/decoder compatibility, in-app video preview, wallpaper picker/application, 0.1-second lock-segment timing, repeated lock/unlock handoff, device lifecycle behavior, actual memory/PSS, long-duration memory growth, frame timing, CPU/battery use, memory pressure, launcher stability, rotation, reboot, and manufacturer-specific launchers. These require an Android SDK and/or physical devices. Do not treat source inspection or an emulator run as a substitute for low-RAM physical-device testing.
+**NOT TESTED:** Android source compilation, APK installation, video selection and persistent URI access, video codec/decoder compatibility, in-app video preview, wallpaper picker/application, 0.1-second lock-segment timing, repeated lock/unlock handoff on a device, actual memory/PSS, long-duration memory growth, frame timing, CPU/battery use, memory pressure, launcher stability, rotation, reboot, and manufacturer-specific launchers. These require an Android SDK and/or physical devices. Do not treat source inspection or an emulator run as a substitute for low-RAM physical-device testing.
