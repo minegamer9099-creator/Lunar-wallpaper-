@@ -92,17 +92,16 @@ class HomeActivity : Activity() {
                     ?.let { Uri.parse(it) }
             )
         }
-        lockSegmentSeekBar.progress = preferences.getInt(
-            DriftWallpaperService.LOCK_SEGMENT_SECONDS_KEY,
-            DEFAULT_LOCK_SEGMENT_SECONDS
-        ).coerceAtLeast(MIN_LOCK_SEGMENT_SECONDS)
+        lockSegmentSeekBar.progress = DriftWallpaperService
+            .readSavedLockSegmentTenths(preferences)
+            .coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS)
         lockSegmentSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 if (!fromUser) return
                 val safeProgress = progress.coerceIn(
-                    MIN_LOCK_SEGMENT_SECONDS,
-                    (seekBar?.max ?: MIN_LOCK_SEGMENT_SECONDS).coerceAtLeast(
-                        MIN_LOCK_SEGMENT_SECONDS
+                    MIN_LOCK_SEGMENT_TENTHS,
+                    (seekBar?.max ?: MIN_LOCK_SEGMENT_TENTHS).coerceAtLeast(
+                        MIN_LOCK_SEGMENT_TENTHS
                     )
                 )
                 if (safeProgress != progress) seekBar?.progress = safeProgress
@@ -114,10 +113,10 @@ class HomeActivity : Activity() {
             override fun onStopTrackingTouch(seekBar: SeekBar?) {
                 preferences.edit()
                     .putInt(
-                        DriftWallpaperService.LOCK_SEGMENT_SECONDS_KEY,
+                        DriftWallpaperService.LOCK_SEGMENT_TENTHS_KEY,
                         lockSegmentSeekBar.progress.coerceIn(
-                            MIN_LOCK_SEGMENT_SECONDS,
-                            lockSegmentSeekBar.max.coerceAtLeast(MIN_LOCK_SEGMENT_SECONDS)
+                            MIN_LOCK_SEGMENT_TENTHS,
+                            lockSegmentSeekBar.max.coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS)
                         )
                     )
                     .apply()
@@ -371,23 +370,21 @@ class HomeActivity : Activity() {
         }
         lockSplitSwitch.isEnabled = durationKnown
         if (durationKnown) {
-            val maxSeconds = (durationMs / 1_000L)
-                .coerceAtLeast(MIN_LOCK_SEGMENT_SECONDS.toLong())
+            val maxTenths = (durationMs / MILLISECONDS_PER_TENTH)
+                .coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS.toLong())
                 .coerceAtMost(Int.MAX_VALUE.toLong())
                 .toInt()
-            lockSegmentSeekBar.max = maxSeconds
-            val configuredSeconds = preferences.getInt(
-                DriftWallpaperService.LOCK_SEGMENT_SECONDS_KEY,
-                DEFAULT_LOCK_SEGMENT_SECONDS
+            lockSegmentSeekBar.max = maxTenths
+            val configuredTenths = DriftWallpaperService
+                .readSavedLockSegmentTenths(preferences)
+            val safeTenths = configuredTenths.coerceIn(
+                MIN_LOCK_SEGMENT_TENTHS,
+                maxTenths
             )
-            val safeSeconds = configuredSeconds.coerceIn(
-                MIN_LOCK_SEGMENT_SECONDS,
-                maxSeconds
-            )
-            lockSegmentSeekBar.progress = safeSeconds
-            if (configuredSeconds != safeSeconds) {
+            lockSegmentSeekBar.progress = safeTenths
+            if (configuredTenths != safeTenths) {
                 preferences.edit()
-                    .putInt(DriftWallpaperService.LOCK_SEGMENT_SECONDS_KEY, safeSeconds)
+                    .putInt(DriftWallpaperService.LOCK_SEGMENT_TENTHS_KEY, safeTenths)
                     .apply()
             }
         }
@@ -404,19 +401,22 @@ class HomeActivity : Activity() {
         val durationMs = preferences.getLong(DriftWallpaperService.VIDEO_DURATION_MS_KEY, 0L)
         if (durationMs <= 0L) return
 
-        val maxSeconds = (durationMs / 1_000L)
-            .coerceAtLeast(MIN_LOCK_SEGMENT_SECONDS.toLong())
+        val maxTenths = (durationMs / MILLISECONDS_PER_TENTH)
+            .coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS.toLong())
             .coerceAtMost(Int.MAX_VALUE.toLong())
             .toInt()
-        val seconds = lockSegmentSeekBar.progress.coerceIn(
-            MIN_LOCK_SEGMENT_SECONDS,
-            maxSeconds
+        val tenths = lockSegmentSeekBar.progress.coerceIn(
+            MIN_LOCK_SEGMENT_TENTHS,
+            maxTenths
         )
         lockSegmentAmount.text = getString(
             R.string.lock_segment_amount,
-            seconds
+            formatTenthsAsSeconds(tenths)
         )
     }
+
+    private fun formatTenthsAsSeconds(tenths: Int): String =
+        "${tenths / 10}.${tenths % 10}"
 
     private fun getDisplayName(uri: Uri): String {
         try {
@@ -442,7 +442,7 @@ class HomeActivity : Activity() {
     companion object {
         private const val REQUEST_VIDEO = 108
         private const val TAG = "LumaDriftHome"
-        private const val DEFAULT_LOCK_SEGMENT_SECONDS = 5
-        private const val MIN_LOCK_SEGMENT_SECONDS = 1
+        private const val MIN_LOCK_SEGMENT_TENTHS = 1
+        private const val MILLISECONDS_PER_TENTH = 100L
     }
 }
