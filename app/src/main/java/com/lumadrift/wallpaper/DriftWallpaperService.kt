@@ -59,6 +59,7 @@ class DriftWallpaperService : WallpaperService() {
         private var receiverRegistered = false
         private var activeLockedSegmentEndMs = 0L
         private var screenIsOn = powerManager.isInteractive
+        private var userPresentConfirmedUntilNextScreenOff = false
         private var resetLockPositionUntilStarted = false
         private var playerPrepared = false
         private var seekInFlight = false
@@ -75,7 +76,7 @@ class DriftWallpaperService : WallpaperService() {
         private var animationStartedAtElapsedMs: Long? = null
 
         private val deferredVideoRelease = Runnable {
-            if (!canDraw() && screenIsOn && !keyguardManager.isKeyguardLocked) {
+            if (!canDraw() && screenIsOn && !isPlaybackKeyguardLocked()) {
                 releaseVideoPlayer(savePosition = !resetLockPositionUntilStarted)
             }
         }
@@ -105,7 +106,7 @@ class DriftWallpaperService : WallpaperService() {
                     return
                 }
 
-                if (!keyguardManager.isKeyguardLocked) {
+                if (!isPlaybackKeyguardLocked()) {
                     cancelLockPauseTimer()
                     refreshScreenStateFromPowerManager()
                     updateRendering()
@@ -127,6 +128,7 @@ class DriftWallpaperService : WallpaperService() {
         }
 
         private fun handleScreenOff() {
+            userPresentConfirmedUntilNextScreenOff = false
             screenIsOn = false
             updateRendering()
         }
@@ -138,6 +140,10 @@ class DriftWallpaperService : WallpaperService() {
 
         private fun handleUserPresent() {
             screenIsOn = true
+            // ACTION_USER_PRESENT confirms authentication. Trust it if KeyguardManager
+            // has not caught up yet; clear the override on screen-off or once it reports
+            // that the keyguard is dismissed.
+            userPresentConfirmedUntilNextScreenOff = true
             resetLockPositionUntilStarted = false
             updateRendering()
         }
@@ -170,6 +176,16 @@ class DriftWallpaperService : WallpaperService() {
 
         override fun onVisibilityChanged(visible: Boolean) {
             this.visible = visible
+            updateRendering(refreshScreenState = true)
+        }
+
+        override fun onSurfaceCreated(holder: SurfaceHolder) {
+            super.onSurfaceCreated(holder)
+            surfaceAvailable = false
+            if (videoSurfaceAttached) {
+                pauseVideoPlayerForTransition(detachSurface = true)
+            }
+            videoSurfaceAttached = false
             updateRendering(refreshScreenState = true)
         }
 
@@ -386,7 +402,7 @@ class DriftWallpaperService : WallpaperService() {
             if (
                 videoPlayer == null ||
                 !screenIsOn ||
-                keyguardManager.isKeyguardLocked
+                isPlaybackKeyguardLocked()
             ) return
             handler.removeCallbacks(deferredVideoRelease)
             handler.postDelayed(deferredVideoRelease, VIDEO_PLAYER_RELEASE_DELAY_MS)
@@ -433,7 +449,7 @@ class DriftWallpaperService : WallpaperService() {
 
                     try {
                         synchronizeLockState()
-                        val isLocked = keyguardManager.isKeyguardLocked
+                        val isLocked = isPlaybackKeyguardLocked()
                         val lockSegmentActive =
                             lockSplitEnabled && isLocked && lockBoundaryMs() > 0L
                         val remainderActive =
@@ -474,7 +490,7 @@ class DriftWallpaperService : WallpaperService() {
                 player.setOnCompletionListener { completedPlayer ->
                     if (videoPlayer !== completedPlayer) return@setOnCompletionListener
                     try {
-                        val isLocked = keyguardManager.isKeyguardLocked
+                        val isLocked = isPlaybackKeyguardLocked()
                         if (lockSplitEnabled && isLocked) {
                             cancelLockPauseTimer()
                             lockSegmentComplete = true
@@ -537,7 +553,7 @@ class DriftWallpaperService : WallpaperService() {
         }
 
         private fun synchronizeLockState() {
-            val isLocked = keyguardManager.isKeyguardLocked
+            val isLocked = isPlaybackKeyguardLocked()
             if (!lockSplitEnabled) {
                 lastKnownLocked = isLocked
                 playRemainderAfterUnlock = false
@@ -552,10 +568,20 @@ class DriftWallpaperService : WallpaperService() {
 
             when {
                 isLocked && lastKnownLocked != true -> beginLockedPlayback()
-                !isLocked && lastKnownLocked == true -> endLockedPlayback()
+                !isLocked && (
+                    lastKnownLocked == true ||
+                        lockSegmentComplete ||
+                        activeLockedSegmentEndMs > 0L
+                    ) -> endLockedPlayback()
                 !isLocked -> resetLockPositionUntilStarted = false
             }
             lastKnownLocked = isLocked
+        }
+
+        private fun isPlaybackKeyguardLocked(): Boolean {
+            val keyguardLocked = keyguardManager.isKeyguardLocked
+            if (!keyguardLocked) userPresentConfirmedUntilNextScreenOff = false
+            return keyguardLocked && !userPresentConfirmedUntilNextScreenOff
         }
 
         private fun beginLockedPlayback() {
@@ -583,8 +609,10 @@ class DriftWallpaperService : WallpaperService() {
             activeLockedSegmentEndMs = 0L
             val boundaryMs = lockBoundaryMs()
             val hasRemainder = boundaryMs > 0L && boundaryMs < videoDurationMs
-            playRemainderAfterUnlock = lockSegmentComplete && hasRemainder
-            val restartWholeVideo = lockSegmentComplete && !hasRemainder
+            val completedLockSegment = lockSegmentComplete
+            playRemainderAfterUnlock = completedLockSegment && hasRemainder
+            val restartWholeVideo = completedLockSegment && !hasRemainder
+            lockSegmentComplete = false
             if (restartWholeVideo) {
                 resumePositionMs = 0L
                 persistResumePosition(0L)
@@ -730,7 +758,7 @@ class DriftWallpaperService : WallpaperService() {
                 !screenIsOn
             ) return
 
-            val isLocked = keyguardManager.isKeyguardLocked
+            val isLocked = isPlaybackKeyguardLocked()
             if (lockSplitEnabled && isLocked && lockSegmentComplete) {
                 if (isPlayerPlaying(player)) {
                     try {
