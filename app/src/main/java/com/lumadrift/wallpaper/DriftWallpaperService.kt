@@ -3,6 +3,9 @@ package com.lumadrift.wallpaper
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RenderEffect
+import android.graphics.RenderNode
+import android.graphics.Shader
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -18,6 +21,7 @@ import android.service.wallpaper.WallpaperService
 import android.util.Log
 import android.view.SurfaceHolder
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 class DriftWallpaperService : WallpaperService() {
@@ -32,6 +36,8 @@ class DriftWallpaperService : WallpaperService() {
             getSystemService(Context.POWER_SERVICE) as PowerManager
         private val basePaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val orbPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private var wallpaperZoom = 0f
+        private var api31BlurRenderer: Api31BlurRenderer? = null
         private var visible = false
         private var surfaceAvailable = false
         private var destroyed = false
@@ -85,6 +91,38 @@ class DriftWallpaperService : WallpaperService() {
                 if (shouldAnimateBuiltIn()) {
                     handler.postDelayed(this, FRAME_INTERVAL_MS)
                 }
+            }
+        }
+
+        private class Api31BlurRenderer {
+            private val renderNode = RenderNode("LumaDriftWallpaper")
+            private var appliedBlurRadiusPx = -1
+
+            fun beginRecording(width: Int, height: Int): Canvas {
+                renderNode.setPosition(0, 0, width, height)
+                return renderNode.beginRecording(width, height)
+            }
+
+            fun endRecording() {
+                renderNode.endRecording()
+            }
+
+            fun draw(canvas: Canvas, blurRadiusPx: Int) {
+                if (appliedBlurRadiusPx != blurRadiusPx) {
+                    renderNode.setRenderEffect(
+                        if (blurRadiusPx > 0) {
+                            RenderEffect.createBlurEffect(
+                                blurRadiusPx.toFloat(),
+                                blurRadiusPx.toFloat(),
+                                Shader.TileMode.CLAMP
+                            )
+                        } else {
+                            null
+                        }
+                    )
+                    appliedBlurRadiusPx = blurRadiusPx
+                }
+                canvas.drawRenderNode(renderNode)
             }
         }
 
@@ -187,6 +225,21 @@ class DriftWallpaperService : WallpaperService() {
         override fun onVisibilityChanged(visible: Boolean) {
             this.visible = visible
             updateRendering(refreshScreenState = true)
+        }
+
+        override fun onZoomChanged(zoom: Float) {
+            val nextZoom = zoom.coerceIn(0f, 1f)
+            if (nextZoom == wallpaperZoom) return
+
+            // Use only the zoom progress supplied by Android; launchers may not send it.
+            wallpaperZoom = nextZoom
+            if (
+                canDraw() &&
+                shouldDrawBuiltInWallpaper() &&
+                !shouldAnimateBuiltIn()
+            ) {
+                drawFrame()
+            }
         }
 
         override fun onSurfaceCreated(holder: SurfaceHolder) {
@@ -361,10 +414,18 @@ class DriftWallpaperService : WallpaperService() {
 
         private fun shouldAnimateBuiltIn(): Boolean =
             animationEnabled &&
-                (selectedVideoUri == null || selectedVideoUri == failedVideoUri) &&
+                shouldDrawBuiltInWallpaper() &&
                 videoPlayer == null &&
                 canDraw() &&
                 screenIsOn
+
+        private fun shouldDrawBuiltInWallpaper(): Boolean =
+            selectedVideoUri == null || selectedVideoUri == failedVideoUri
+
+        private fun blurRadiusPx(): Int =
+            (min(surfaceWidth, surfaceHeight) * MAX_BLUR_RADIUS_FRACTION * wallpaperZoom)
+                .roundToInt()
+                .coerceIn(0, MAX_BLUR_RADIUS_PX)
 
         private fun updateAnimationClock() {
             val shouldRun = shouldAnimateBuiltIn()
@@ -856,8 +917,17 @@ class DriftWallpaperService : WallpaperService() {
             val holder = surfaceHolder
             var canvas: Canvas? = null
             try {
-                canvas = holder.lockCanvas()
-                if (canvas != null) render(canvas, animationTimeMs())
+                canvas = if (shouldUseHardwareBlurCanvas()) {
+                    try {
+                        holder.lockHardwareCanvas()
+                    } catch (error: RuntimeException) {
+                        Log.w(TAG, "Hardware canvas unavailable for the wallpaper transition", error)
+                        holder.lockCanvas()
+                    }
+                } else {
+                    holder.lockCanvas()
+                }
+                if (canvas != null) renderFrame(canvas, animationTimeMs())
             } catch (error: RuntimeException) {
                 Log.w(TAG, "Wallpaper surface is not available for drawing", error)
             } finally {
@@ -869,6 +939,37 @@ class DriftWallpaperService : WallpaperService() {
                     }
                 }
             }
+        }
+
+        private fun shouldUseHardwareBlurCanvas(): Boolean =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                wallpaperZoom > 0f &&
+                shouldDrawBuiltInWallpaper() &&
+                blurRadiusPx() > 0
+
+        private fun renderFrame(canvas: Canvas, timeMs: Long) {
+            val blurRadius = blurRadiusPx()
+            if (
+                Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+                !canvas.isHardwareAccelerated ||
+                !shouldDrawBuiltInWallpaper() ||
+                blurRadius == 0
+            ) {
+                // Video stays on MediaPlayer's direct Surface path; no frame copy or blur pass.
+                render(canvas, timeMs)
+                return
+            }
+
+            val renderer = api31BlurRenderer ?: Api31BlurRenderer().also {
+                api31BlurRenderer = it
+            }
+            val recordingCanvas = renderer.beginRecording(surfaceWidth, surfaceHeight)
+            try {
+                render(recordingCanvas, timeMs)
+            } finally {
+                renderer.endRecording()
+            }
+            renderer.draw(canvas, blurRadius)
         }
 
         private fun render(canvas: Canvas, timeMs: Long) {
@@ -926,6 +1027,8 @@ class DriftWallpaperService : WallpaperService() {
         private const val TAG = "LumaDrift"
         private const val FRAME_INTERVAL_MS = 1_000L / 24L
         private const val VIDEO_PLAYER_RELEASE_DELAY_MS = 5_000L
+        private const val MAX_BLUR_RADIUS_PX = 8
+        private const val MAX_BLUR_RADIUS_FRACTION = 0.006f
         private const val MILLISECONDS_PER_TENTH = 100L
         private const val SEEK_TOLERANCE_MS = 80L
     }
