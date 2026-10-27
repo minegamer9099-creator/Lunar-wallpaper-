@@ -375,10 +375,8 @@ class DriftWallpaperService : WallpaperService() {
                     .apply()
                 loopSeekPending = false
                 cancelLoopBoundaryTimer()
-                if (videoUri != null && videoUri != failedVideoUri) {
-                    // Replace the Surface's retained pre-lock buffer before video output is reattached.
-                    drawFrame()
-                }
+                // Keep the retained video buffer while MediaPlayer reattaches.
+                // Drawing here would paint the built-in scene over the selected video.
             }
 
             if (videoUri != null && videoUri != failedVideoUri) {
