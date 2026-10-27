@@ -26,6 +26,22 @@ To install on a connected device:
 ./gradlew installDebug
 ```
 
+### Build in Termux on ARM64
+
+Android Gradle Plugin may download a Linux x86_64 `aapt2`, which cannot run natively in Termux on ARM64. Install or provide a Termux-compatible native `aapt2`, then run:
+
+```sh
+bash termux-build.sh
+```
+
+The script checks that `aapt2` runs, then passes `android.aapt2FromMavenOverride` only to that Gradle invocation. If `aapt2` is not on `PATH`, provide its absolute path:
+
+```sh
+AAPT2_PATH=/absolute/path/to/aapt2 bash termux-build.sh
+```
+
+You can pass other Gradle tasks as arguments, for example `bash termux-build.sh assembleDebug`. This workaround only addresses the AAPT2 executable architecture; a compatible JDK, Android SDK/platforms, and Android Build Tools are still required. Standard Android Studio and GitHub Actions builds continue using their normal AAPT2 configuration.
+
 ## Build a release APK
 
 ```sh
@@ -53,10 +69,11 @@ The 20–30 MB process-memory objective is not a guaranteed cap. Measure Java/Ko
 
 ## Test record
 
-Environment checks performed for the transition update:
+Environment checks performed for the transition update and Termux build workaround:
 
 - Source-level checks cover the existing screen-off restart and loop state plus the new zoom-gated blur path, cached blur effect, and direct video-surface path.
-- Android XML resources parse successfully.
+- All 11 Android XML resources parse successfully.
+- `bash -n termux-build.sh` passed, and a wrapper smoke test confirmed that the native AAPT2 path is passed only to that Gradle invocation.
 - `assembleDebug --offline --no-daemon` could not start because this environment has no Java runtime. `ANDROID_HOME` and `ANDROID_SDK_ROOT` are unset, and no Android SDK is available here.
 
 **NOT TESTED:** Android source compilation, APK installation, the app/home/recents transitions on a device, blur support in specific launchers, video loop continuity during transitions, surface recreation, video codec behavior, memory/PSS, CPU/battery use, and manufacturer-specific wallpaper behavior. These require an Android SDK and/or physical devices.
