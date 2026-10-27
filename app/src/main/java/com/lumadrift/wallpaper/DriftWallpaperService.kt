@@ -27,6 +27,38 @@ import kotlin.math.sin
 class DriftWallpaperService : WallpaperService() {
     override fun onCreateEngine(): Engine = DriftEngine()
 
+    private class Api31BlurRenderer {
+        private val renderNode = RenderNode("LumaDriftWallpaper")
+        private var appliedBlurRadiusPx = -1
+
+        fun beginRecording(width: Int, height: Int): Canvas {
+            renderNode.setPosition(0, 0, width, height)
+            return renderNode.beginRecording(width, height)
+        }
+
+        fun endRecording() {
+            renderNode.endRecording()
+        }
+
+        fun draw(canvas: Canvas, blurRadiusPx: Int) {
+            if (appliedBlurRadiusPx != blurRadiusPx) {
+                renderNode.setRenderEffect(
+                    if (blurRadiusPx > 0) {
+                        RenderEffect.createBlurEffect(
+                            blurRadiusPx.toFloat(),
+                            blurRadiusPx.toFloat(),
+                            Shader.TileMode.CLAMP
+                        )
+                    } else {
+                        null
+                    }
+                )
+                appliedBlurRadiusPx = blurRadiusPx
+            }
+            canvas.drawRenderNode(renderNode)
+        }
+    }
+
     private inner class DriftEngine : Engine(),
         android.content.SharedPreferences.OnSharedPreferenceChangeListener {
 
@@ -91,38 +123,6 @@ class DriftWallpaperService : WallpaperService() {
                 if (shouldAnimateBuiltIn()) {
                     handler.postDelayed(this, FRAME_INTERVAL_MS)
                 }
-            }
-        }
-
-        private class Api31BlurRenderer {
-            private val renderNode = RenderNode("LumaDriftWallpaper")
-            private var appliedBlurRadiusPx = -1
-
-            fun beginRecording(width: Int, height: Int): Canvas {
-                renderNode.setPosition(0, 0, width, height)
-                return renderNode.beginRecording(width, height)
-            }
-
-            fun endRecording() {
-                renderNode.endRecording()
-            }
-
-            fun draw(canvas: Canvas, blurRadiusPx: Int) {
-                if (appliedBlurRadiusPx != blurRadiusPx) {
-                    renderNode.setRenderEffect(
-                        if (blurRadiusPx > 0) {
-                            RenderEffect.createBlurEffect(
-                                blurRadiusPx.toFloat(),
-                                blurRadiusPx.toFloat(),
-                                Shader.TileMode.CLAMP
-                            )
-                        } else {
-                            null
-                        }
-                    )
-                    appliedBlurRadiusPx = blurRadiusPx
-                }
-                canvas.drawRenderNode(renderNode)
             }
         }
 
