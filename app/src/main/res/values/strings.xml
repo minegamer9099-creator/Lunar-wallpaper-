@@ -15,7 +15,7 @@
     <string name="video_resolution_note">Any resolution is allowed. High-resolution videos may stutter or fail on some phones.</string>
     <string name="video_loop_range_title">Video Loop Range</string>
     <string name="video_loop_enabled">Repeat selected range</string>
-    <string name="video_loop_description">Play from 0 seconds, then repeat between Loop Start and Loop End. Adjust in 0.1-second steps. Screen-on starts at 0; unlocking keeps the current position.</string>
+    <string name="video_loop_description">Play from 0 seconds, then repeat between Loop Start and Loop End. Adjust in 0.1-second steps. Locking pauses playback; unlocking resumes from the saved position.</string>
     <string name="loop_start_label">Loop Start</string>
     <string name="loop_end_label">Loop End</string>
     <string name="loop_range_summary">%1$s–%2$s s repeat range</string>
