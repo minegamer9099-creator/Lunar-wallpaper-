@@ -3,7 +3,6 @@ package com.lumadrift.wallpaper
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -29,8 +28,6 @@ class DriftWallpaperService : WallpaperService() {
 
         private val handler = Handler(Looper.getMainLooper())
         private val preferences = getSharedPreferences(PREFERENCES_NAME, MODE_PRIVATE)
-        private val keyguardManager =
-            getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
         private val powerManager =
             getSystemService(Context.POWER_SERVICE) as PowerManager
         private val basePaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -39,8 +36,11 @@ class DriftWallpaperService : WallpaperService() {
         private var surfaceAvailable = false
         private var destroyed = false
         private var animationEnabled = preferences.getBoolean(ANIMATION_ENABLED_KEY, true)
-        private var lockSplitEnabled = preferences.getBoolean(LOCK_SPLIT_ENABLED_KEY, false)
-        private var lockSegmentTenths = readSavedLockSegmentTenths(preferences)
+        private var videoLoopEnabled = preferences.getBoolean(VIDEO_LOOP_ENABLED_KEY, false)
+        private var loopStartTenths = preferences.getInt(VIDEO_LOOP_START_TENTHS_KEY, 0)
+            .coerceAtLeast(0)
+        private var loopEndTenths = preferences.getInt(VIDEO_LOOP_END_TENTHS_KEY, 0)
+            .coerceAtLeast(0)
         private var videoDurationMs = preferences.getLong(VIDEO_DURATION_MS_KEY, 0L)
         private var surfaceWidth = 0
         private var surfaceHeight = 0
@@ -53,32 +53,28 @@ class DriftWallpaperService : WallpaperService() {
         private var resumePositionMs = preferences
             .getLong(VIDEO_RESUME_POSITION_MS_KEY, 0L)
             .coerceAtLeast(0L)
-        private var lastKnownLocked: Boolean? = null
-        private var playRemainderAfterUnlock = false
-        private var lockSegmentComplete = false
         private var receiverRegistered = false
-        private var activeLockedSegmentEndMs = 0L
         private var screenIsOn = powerManager.isInteractive
-        private var userPresentConfirmedUntilNextScreenOff = false
-        private var resetLockPositionUntilStarted = false
+        private var restartAtNextScreenOn = preferences.getBoolean(
+            RESTART_VIDEO_ON_SCREEN_ON_KEY,
+            false
+        ) || !screenIsOn
         private var playerPrepared = false
         private var seekInFlight = false
         private var desiredSeekPositionMs: Long? = null
         private var issuedSeekPositionMs = 0L
         private var startAfterSeek = false
-        private var lockTimerPlayer: MediaPlayer? = null
-        private var lockTimerGeneration = 0L
-        private var scheduledLockTimerGeneration = 0L
-        private var lockPauseDeadlineUptimeMs = 0L
+        private var loopSeekPending = false
+        private var loopTimerPlayer: MediaPlayer? = null
+        private var loopTimerGeneration = 0L
+        private var scheduledLoopTimerGeneration = 0L
         private var animationElapsedBeforePauseMs = preferences
             .getLong(BUILT_IN_ANIMATION_TIME_MS_KEY, 0L)
             .coerceAtLeast(0L)
         private var animationStartedAtElapsedMs: Long? = null
 
         private val deferredVideoRelease = Runnable {
-            if (!canDraw() && screenIsOn && !isPlaybackKeyguardLocked()) {
-                releaseVideoPlayer(savePosition = !resetLockPositionUntilStarted)
-            }
+            if (!canDraw() && screenIsOn) releaseVideoPlayer(savePosition = true)
         }
 
         private val frame = object : Runnable {
@@ -91,60 +87,59 @@ class DriftWallpaperService : WallpaperService() {
             }
         }
 
-        private val lockSegmentBoundaryCheck = object : Runnable {
+        private val loopEndBoundaryCheck = object : Runnable {
             override fun run() {
                 val player = videoPlayer ?: return
                 if (
-                    player !== lockTimerPlayer ||
-                    scheduledLockTimerGeneration != lockTimerGeneration ||
-                    !lockSplitEnabled
+                    player !== loopTimerPlayer ||
+                    scheduledLoopTimerGeneration != loopTimerGeneration ||
+                    !videoLoopEnabled ||
+                    !isLoopRangeValid() ||
+                    !canDraw() ||
+                    !screenIsOn
                 ) return
+                if (!isPlayerPlaying(player)) {
+                    cancelLoopBoundaryTimer()
+                    return
+                }
 
-                val remainingMs = lockPauseDeadlineUptimeMs - SystemClock.uptimeMillis()
+                val currentPositionMs = try {
+                    player.currentPosition.toLong()
+                } catch (error: IllegalStateException) {
+                    Log.w(TAG, "Could not read video position at the loop boundary", error)
+                    cancelLoopBoundaryTimer()
+                    return
+                }
+
+                val remainingMs = loopEndMs() - currentPositionMs
                 if (remainingMs > 0L) {
-                    handler.postDelayed(this, remainingMs)
-                    return
+                    scheduleLoopBoundary(player, remainingMs)
+                } else {
+                    jumpToLoopStart(player)
                 }
-
-                if (!isPlaybackKeyguardLocked()) {
-                    cancelLockPauseTimer()
-                    refreshScreenStateFromPowerManager()
-                    updateRendering()
-                    return
-                }
-
-                completeLockedSegment(player)
             }
         }
 
-        private val lockStateReceiver = object : BroadcastReceiver() {
+        private val screenStateReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 when (intent?.action) {
                     Intent.ACTION_SCREEN_OFF -> handleScreenOff()
                     Intent.ACTION_SCREEN_ON -> handleScreenOn()
-                    Intent.ACTION_USER_PRESENT -> handleUserPresent()
                 }
             }
         }
 
         private fun handleScreenOff() {
-            userPresentConfirmedUntilNextScreenOff = false
             screenIsOn = false
+            restartAtNextScreenOn = true
+            preferences.edit()
+                .putBoolean(RESTART_VIDEO_ON_SCREEN_ON_KEY, true)
+                .apply()
             updateRendering()
         }
 
         private fun handleScreenOn() {
             screenIsOn = true
-            updateRendering()
-        }
-
-        private fun handleUserPresent() {
-            screenIsOn = true
-            // ACTION_USER_PRESENT confirms authentication. Trust it if KeyguardManager
-            // has not caught up yet; clear the override on screen-off or once it reports
-            // that the keyguard is dismissed.
-            userPresentConfirmedUntilNextScreenOff = true
-            resetLockPositionUntilStarted = false
             updateRendering()
         }
 
@@ -159,17 +154,16 @@ class DriftWallpaperService : WallpaperService() {
             val filter = IntentFilter().apply {
                 addAction(Intent.ACTION_SCREEN_OFF)
                 addAction(Intent.ACTION_SCREEN_ON)
-                addAction(Intent.ACTION_USER_PRESENT)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 registerReceiver(
-                    lockStateReceiver,
+                    screenStateReceiver,
                     filter,
                     Context.RECEIVER_NOT_EXPORTED
                 )
             } else {
                 @Suppress("DEPRECATION")
-                registerReceiver(lockStateReceiver, filter)
+                registerReceiver(screenStateReceiver, filter)
             }
             receiverRegistered = true
         }
@@ -213,10 +207,10 @@ class DriftWallpaperService : WallpaperService() {
             handler.removeCallbacks(frame)
             handler.removeCallbacks(deferredVideoRelease)
             updateAnimationClock()
-            cancelLockPauseTimer()
-            releaseVideoPlayer(savePosition = !resetLockPositionUntilStarted)
+            cancelLoopBoundaryTimer()
+            releaseVideoPlayer(savePosition = true)
             if (receiverRegistered) {
-                unregisterReceiver(lockStateReceiver)
+                unregisterReceiver(screenStateReceiver)
                 receiverRegistered = false
             }
             preferences.unregisterOnSharedPreferenceChangeListener(this)
@@ -248,28 +242,35 @@ class DriftWallpaperService : WallpaperService() {
                             failedVideoUri = null
                         }
                         videoDurationMs = preferences.getLong(VIDEO_DURATION_MS_KEY, 0L)
-                        lastKnownLocked = null
-                        playRemainderAfterUnlock = false
-                        lockSegmentComplete = false
+                        videoLoopEnabled = preferences.getBoolean(VIDEO_LOOP_ENABLED_KEY, false)
+                        loopStartTenths = preferences.getInt(
+                            VIDEO_LOOP_START_TENTHS_KEY,
+                            0
+                        ).coerceAtLeast(0)
+                        loopEndTenths = preferences.getInt(
+                            VIDEO_LOOP_END_TENTHS_KEY,
+                            0
+                        ).coerceAtLeast(0)
+                        loopSeekPending = false
+                        cancelLoopBoundaryTimer()
                         releaseVideoPlayer(savePosition = false)
                     }
                     updateRendering()
                 }
                 VIDEO_DURATION_MS_KEY -> {
                     videoDurationMs = preferences.getLong(VIDEO_DURATION_MS_KEY, 0L)
+                    normalizeLoopRange()
                     updateRendering()
                 }
-                LOCK_SPLIT_ENABLED_KEY -> {
-                    lockSplitEnabled = preferences.getBoolean(LOCK_SPLIT_ENABLED_KEY, false)
-                    resetSplitPlaybackForPreferenceChange()
+                VIDEO_LOOP_ENABLED_KEY -> {
+                    videoLoopEnabled = preferences.getBoolean(VIDEO_LOOP_ENABLED_KEY, false)
+                    applyLoopRangeToActivePlayer()
                     updateRendering()
                 }
-                LOCK_SEGMENT_TENTHS_KEY -> {
-                    lockSegmentTenths = preferences.getInt(
-                        LOCK_SEGMENT_TENTHS_KEY,
-                        DEFAULT_LOCK_SEGMENT_TENTHS
-                    ).coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS)
-                    resetSplitPlaybackForPreferenceChange()
+                VIDEO_LOOP_START_TENTHS_KEY,
+                VIDEO_LOOP_END_TENTHS_KEY -> {
+                    normalizeLoopRange()
+                    applyLoopRangeToActivePlayer()
                     updateRendering()
                 }
             }
@@ -282,7 +283,6 @@ class DriftWallpaperService : WallpaperService() {
             handler.removeCallbacks(frame)
             handler.removeCallbacks(deferredVideoRelease)
             if (refreshScreenState) refreshScreenStateFromPowerManager()
-            synchronizeLockState()
             updateAnimationClock()
             if (!canDraw() || !screenIsOn) {
                 pauseVideoPlayerForTransition(detachSurface = !surfaceAvailable)
@@ -290,16 +290,32 @@ class DriftWallpaperService : WallpaperService() {
                 return
             }
 
+            val restartPlayback = restartAtNextScreenOn
+            if (restartPlayback) {
+                restartAtNextScreenOn = false
+                resumePositionMs = 0L
+                persistResumePosition(0L)
+                preferences.edit()
+                    .putBoolean(RESTART_VIDEO_ON_SCREEN_ON_KEY, false)
+                    .apply()
+                loopSeekPending = false
+                cancelLoopBoundaryTimer()
+            }
+
             val videoUri = selectedVideoUri
             if (videoUri != null && videoUri != failedVideoUri) {
                 if (activeVideoUri == videoUri && videoPlayer != null) {
                     val player = videoPlayer ?: return
                     if (!attachVideoSurface(player)) return
-                    if (playerPrepared && !isPlayerPlaying(player)) {
+                    if (
+                        playerPrepared &&
+                        (restartPlayback || !isPlayerPlaying(player))
+                    ) {
                         requestPlaybackPosition(
                             player,
-                            resumePositionMs,
-                            shouldStart = true
+                            if (restartPlayback) 0L else resumePositionMs,
+                            shouldStart = true,
+                            forceSeek = restartPlayback
                         )
                     }
                     return
@@ -347,23 +363,15 @@ class DriftWallpaperService : WallpaperService() {
         }
 
         private fun pauseVideoPlayerForTransition(detachSurface: Boolean) {
-            cancelLockPauseTimer()
+            cancelLoopBoundaryTimer()
             val player = videoPlayer ?: return
+            loopSeekPending = false
 
             if (playerPrepared) {
                 try {
-                    if (
-                        !resetLockPositionUntilStarted &&
-                        activeVideoUri == selectedVideoUri
-                    ) {
+                    if (activeVideoUri == selectedVideoUri) {
                         val currentPositionMs = player.currentPosition.toLong()
-                        val lockSegmentEnd = activeLockedSegmentEndMs
-                        if (lockSegmentEnd > 0L && currentPositionMs >= lockSegmentEnd) {
-                            resumePositionMs = lockSegmentEnd
-                            lockSegmentComplete = true
-                        } else {
-                            resumePositionMs = currentPositionMs
-                        }
+                        resumePositionMs = currentPositionMs.coerceAtLeast(0L)
                         persistResumePosition(resumePositionMs)
                     }
                     if (player.isPlaying) player.pause()
@@ -399,11 +407,7 @@ class DriftWallpaperService : WallpaperService() {
         }
 
         private fun scheduleDeferredVideoReleaseIfNeeded() {
-            if (
-                videoPlayer == null ||
-                !screenIsOn ||
-                isPlaybackKeyguardLocked()
-            ) return
+            if (videoPlayer == null || !screenIsOn) return
             handler.removeCallbacks(deferredVideoRelease)
             handler.postDelayed(deferredVideoRelease, VIDEO_PLAYER_RELEASE_DELAY_MS)
         }
@@ -444,39 +448,20 @@ class DriftWallpaperService : WallpaperService() {
 
                     playerPrepared = true
                     val actualDurationMs = preparedPlayer.duration.toLong()
-                    if (actualDurationMs > 0L) videoDurationMs = actualDurationMs
+                    if (actualDurationMs > 0L) {
+                        videoDurationMs = actualDurationMs
+                        normalizeLoopRange()
+                    }
                     if (!canDraw() || !screenIsOn) return@setOnPreparedListener
 
                     try {
-                        synchronizeLockState()
-                        val isLocked = isPlaybackKeyguardLocked()
-                        val lockSegmentActive =
-                            lockSplitEnabled && isLocked && lockBoundaryMs() > 0L
-                        val remainderActive =
-                            lockSplitEnabled && !isLocked && playRemainderAfterUnlock &&
-                                lockBoundaryMs() > 0L
-                        val segmentEndMs = lockBoundaryMs()
-                        val startPositionMs = when {
-                            lockSegmentActive ->
-                                resumePositionMs.coerceIn(0L, segmentEndMs)
-                            remainderActive && segmentEndMs < videoDurationMs ->
-                                resumePositionMs.coerceIn(segmentEndMs, videoDurationMs)
-                            remainderActive -> 0L
-                            else -> resumePositionMs
-                        }
-                        if (remainderActive && segmentEndMs >= videoDurationMs) {
-                            resumePositionMs = 0L
-                            playRemainderAfterUnlock = false
-                        }
-                        activeLockedSegmentEndMs =
-                            if (lockSegmentActive) segmentEndMs else 0L
-                        val shouldStart = screenIsOn && canDraw() &&
-                            !(lockSegmentActive && lockSegmentComplete)
                         requestPlaybackPosition(
                             preparedPlayer,
-                            startPositionMs,
-                            shouldStart,
-                            forceSeek = remainderActive
+                            resumePositionMs.coerceIn(
+                                0L,
+                                videoDurationMs.coerceAtLeast(0L)
+                            ),
+                            shouldStart = screenIsOn && canDraw()
                         )
                     } catch (error: IllegalStateException) {
                         handleVideoFailure(
@@ -490,29 +475,7 @@ class DriftWallpaperService : WallpaperService() {
                 player.setOnCompletionListener { completedPlayer ->
                     if (videoPlayer !== completedPlayer) return@setOnCompletionListener
                     try {
-                        val isLocked = isPlaybackKeyguardLocked()
-                        if (lockSplitEnabled && isLocked) {
-                            cancelLockPauseTimer()
-                            lockSegmentComplete = true
-                            resumePositionMs = completedPlayer.currentPosition.toLong()
-                                .coerceIn(0L, lockBoundaryMs())
-                            activeLockedSegmentEndMs = 0L
-                            return@setOnCompletionListener
-                        }
-
-                        val boundaryMs = lockBoundaryMs()
-                        val loopStartMs = if (
-                            lockSplitEnabled &&
-                            playRemainderAfterUnlock &&
-                            !isLocked &&
-                            boundaryMs < videoDurationMs
-                        ) boundaryMs else 0L
-                        requestPlaybackPosition(
-                            completedPlayer,
-                            loopStartMs,
-                            shouldStart = true,
-                            forceSeek = loopStartMs > 0L
-                        )
+                        jumpToLoopStart(completedPlayer)
                     } catch (error: IllegalStateException) {
                         handleVideoFailure(
                             uri,
@@ -552,124 +515,112 @@ class DriftWallpaperService : WallpaperService() {
             }
         }
 
-        private fun synchronizeLockState() {
-            val isLocked = isPlaybackKeyguardLocked()
-            if (!lockSplitEnabled) {
-                lastKnownLocked = isLocked
-                playRemainderAfterUnlock = false
-                lockSegmentComplete = false
-                if (!isLocked) resetLockPositionUntilStarted = false
+        private fun normalizeLoopRange() {
+            val maxTenths = (videoDurationMs / MILLISECONDS_PER_TENTH)
+                .coerceAtMost(Int.MAX_VALUE.toLong())
+                .toInt()
+            if (maxTenths < 1) {
+                loopStartTenths = 0
+                loopEndTenths = 0
+                cancelLoopBoundaryTimer()
                 return
             }
 
-            // Screen-off/on does not begin a second lock segment. Wait for an actual
-            // keyguard transition, then start or finish the segment exactly once.
-            if (!screenIsOn) return
-
-            when {
-                isLocked && lastKnownLocked != true -> beginLockedPlayback()
-                !isLocked && (
-                    lastKnownLocked == true ||
-                        lockSegmentComplete ||
-                        activeLockedSegmentEndMs > 0L
-                    ) -> endLockedPlayback()
-                !isLocked -> resetLockPositionUntilStarted = false
-            }
-            lastKnownLocked = isLocked
-        }
-
-        private fun isPlaybackKeyguardLocked(): Boolean {
-            val keyguardLocked = keyguardManager.isKeyguardLocked
-            if (!keyguardLocked) userPresentConfirmedUntilNextScreenOff = false
-            return keyguardLocked && !userPresentConfirmedUntilNextScreenOff
-        }
-
-        private fun beginLockedPlayback() {
-            cancelLockPauseTimer()
-            playRemainderAfterUnlock = false
-            lockSegmentComplete = false
-            resumePositionMs = 0L
-            persistResumePosition(0L)
-            activeLockedSegmentEndMs = lockBoundaryMs()
-            resetLockPositionUntilStarted = true
-
-            val player = videoPlayer
-            if (player != null && playerPrepared) {
-                requestPlaybackPosition(
-                    player,
-                    0L,
-                    shouldStart = screenIsOn && canDraw(),
-                    forceSeek = playerPrepared
-                )
-            }
-        }
-
-        private fun endLockedPlayback() {
-            cancelLockPauseTimer()
-            activeLockedSegmentEndMs = 0L
-            val boundaryMs = lockBoundaryMs()
-            val hasRemainder = boundaryMs > 0L && boundaryMs < videoDurationMs
-            val completedLockSegment = lockSegmentComplete
-            playRemainderAfterUnlock = completedLockSegment && hasRemainder
-            val restartWholeVideo = completedLockSegment && !hasRemainder
-            lockSegmentComplete = false
-            if (restartWholeVideo) {
-                resumePositionMs = 0L
-                persistResumePosition(0L)
-            }
-            resetLockPositionUntilStarted = false
-
-            val player = videoPlayer
-            if (player != null && playerPrepared) {
-                if (restartWholeVideo) {
-                    if (screenIsOn && canDraw()) {
-                        requestPlaybackPosition(player, 0L, shouldStart = true)
-                    }
-                } else if (playRemainderAfterUnlock) {
-                    resumePositionMs = boundaryMs
-                    persistResumePosition(boundaryMs)
-                    if (screenIsOn && canDraw()) {
-                        requestPlaybackPosition(
-                            player,
-                            boundaryMs,
-                            shouldStart = true,
-                            forceSeek = true
-                        )
-                    }
+            val storedStart = preferences.getInt(VIDEO_LOOP_START_TENTHS_KEY, 0)
+            val storedEnd = preferences.getInt(VIDEO_LOOP_END_TENTHS_KEY, maxTenths)
+            var safeStart = storedStart.coerceIn(0, maxTenths - 1)
+            var safeEnd = storedEnd.coerceIn(1, maxTenths)
+            if (safeEnd <= safeStart) {
+                if (safeStart < maxTenths - 1) {
+                    safeEnd = safeStart + 1
                 } else {
-                    val currentPositionMs = try {
-                        player.currentPosition.toLong()
-                    } catch (_: IllegalStateException) {
-                        resumePositionMs
-                    }
-                    if (currentPositionMs >= 0L) {
-                        resumePositionMs = currentPositionMs
-                        persistResumePosition(currentPositionMs)
-                    }
-                    if (screenIsOn && canDraw() && !isPlayerPlaying(player)) {
-                        requestPlaybackPosition(player, resumePositionMs, shouldStart = true)
-                    }
+                    safeStart = safeEnd - 1
                 }
             }
+
+            loopStartTenths = safeStart
+            loopEndTenths = safeEnd
+            if (
+                storedStart != safeStart ||
+                storedEnd != safeEnd ||
+                !preferences.contains(VIDEO_LOOP_START_TENTHS_KEY) ||
+                !preferences.contains(VIDEO_LOOP_END_TENTHS_KEY)
+            ) {
+                preferences.edit()
+                    .putInt(VIDEO_LOOP_START_TENTHS_KEY, safeStart)
+                    .putInt(VIDEO_LOOP_END_TENTHS_KEY, safeEnd)
+                    .apply()
+            }
         }
 
-        private fun resetSplitPlaybackForPreferenceChange() {
-            lastKnownLocked = null
-            playRemainderAfterUnlock = false
-            lockSegmentComplete = false
-            resumePositionMs = 0L
-            persistResumePosition(0L)
-            resetLockPositionUntilStarted = false
-            activeLockedSegmentEndMs = 0L
-            releaseVideoPlayer(savePosition = false)
+        private fun isLoopRangeValid(): Boolean {
+            if (!videoLoopEnabled || videoDurationMs <= 0L) return false
+            val startMs = loopStartTenths.toLong() * MILLISECONDS_PER_TENTH
+            val endMs = loopEndTenths.toLong() * MILLISECONDS_PER_TENTH
+            return startMs >= 0L && startMs < endMs && endMs <= videoDurationMs
         }
 
-        private fun lockBoundaryMs(): Long {
-            if (videoDurationMs <= 0L) return 0L
-            val requestedDurationMs = lockSegmentTenths
-                .coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS)
-                .toLong() * MILLISECONDS_PER_TENTH
-            return requestedDurationMs.coerceAtMost(videoDurationMs)
+        private fun loopStartMs(): Long =
+            (loopStartTenths.toLong() * MILLISECONDS_PER_TENTH)
+                .coerceIn(0L, videoDurationMs.coerceAtLeast(0L))
+
+        private fun loopEndMs(): Long =
+            (loopEndTenths.toLong() * MILLISECONDS_PER_TENTH)
+                .coerceIn(0L, videoDurationMs.coerceAtLeast(0L))
+
+        private fun scheduleLoopBoundary(player: MediaPlayer, delayMs: Long) {
+            cancelLoopBoundaryTimer()
+            if (
+                videoPlayer !== player ||
+                !playerPrepared ||
+                !videoLoopEnabled ||
+                !isLoopRangeValid() ||
+                loopEndMs() >= videoDurationMs
+            ) return
+
+            loopTimerPlayer = player
+            scheduledLoopTimerGeneration = loopTimerGeneration
+            handler.postDelayed(loopEndBoundaryCheck, delayMs.coerceAtLeast(1L))
+        }
+
+        private fun cancelLoopBoundaryTimer() {
+            handler.removeCallbacks(loopEndBoundaryCheck)
+            loopTimerPlayer = null
+            loopTimerGeneration += 1L
+        }
+
+        private fun jumpToLoopStart(player: MediaPlayer) {
+            if (videoPlayer !== player || loopSeekPending) return
+            cancelLoopBoundaryTimer()
+            loopSeekPending = true
+            val targetMs = if (isLoopRangeValid()) loopStartMs() else 0L
+            requestPlaybackPosition(
+                player,
+                targetMs,
+                shouldStart = true,
+                forceSeek = true
+            )
+        }
+
+        private fun applyLoopRangeToActivePlayer() {
+            cancelLoopBoundaryTimer()
+            loopSeekPending = false
+            val player = videoPlayer ?: return
+            if (!playerPrepared || !isPlayerPlaying(player)) return
+            if (!isLoopRangeValid()) return
+
+            val currentPositionMs = try {
+                player.currentPosition.toLong()
+            } catch (error: IllegalStateException) {
+                Log.w(TAG, "Could not update the active video loop range", error)
+                return
+            }
+            val endMs = loopEndMs()
+            if (currentPositionMs >= endMs) {
+                jumpToLoopStart(player)
+            } else {
+                scheduleLoopBoundary(player, endMs - currentPositionMs)
+            }
         }
 
         private fun requestPlaybackPosition(
@@ -751,61 +702,35 @@ class DriftWallpaperService : WallpaperService() {
         }
 
         private fun startPreparedPlayer(player: MediaPlayer) {
+            if (videoPlayer !== player) return
+            loopSeekPending = false
             if (
-                videoPlayer !== player ||
                 !playerPrepared ||
                 !canDraw() ||
                 !screenIsOn
             ) return
 
-            val isLocked = isPlaybackKeyguardLocked()
-            if (lockSplitEnabled && isLocked && lockSegmentComplete) {
-                if (isPlayerPlaying(player)) {
-                    try {
-                        player.pause()
-                    } catch (_: IllegalStateException) {
-                        // The player is being released or reset by Android.
-                    }
-                }
-                return
-            }
-
             try {
-                if (lockSplitEnabled && isLocked) {
-                    val boundaryMs = lockBoundaryMs()
+                if (isLoopRangeValid()) {
                     val currentPositionMs = player.currentPosition.toLong()
-                    activeLockedSegmentEndMs = boundaryMs
-                    if (boundaryMs > 0L && currentPositionMs >= boundaryMs) {
-                        if (player.isPlaying) player.pause()
-                        resumePositionMs = currentPositionMs.coerceAtMost(boundaryMs)
-                        lockSegmentComplete = true
-                        activeLockedSegmentEndMs = 0L
-                        cancelLockPauseTimer()
+                    if (currentPositionMs >= loopEndMs()) {
+                        jumpToLoopStart(player)
                         return
                     }
                 }
 
                 if (!player.isPlaying) player.start()
-                if (lockSplitEnabled && isLocked) {
-                    val boundaryMs = lockBoundaryMs()
-                    val currentPositionMs = player.currentPosition.toLong()
-
-                    if (boundaryMs > 0L) {
-                        resumePositionMs = currentPositionMs
-                        scheduleLockPause(
-                            player,
-                            (boundaryMs - currentPositionMs).coerceAtLeast(1L)
-                        )
-                    } else {
-                        cancelLockPauseTimer()
-                        activeLockedSegmentEndMs = 0L
-                    }
+                val currentPositionMs = player.currentPosition.toLong().coerceAtLeast(0L)
+                resumePositionMs = currentPositionMs
+                persistResumePosition(currentPositionMs)
+                if (isLoopRangeValid() && loopEndMs() < videoDurationMs) {
+                    scheduleLoopBoundary(
+                        player,
+                        (loopEndMs() - currentPositionMs).coerceAtLeast(1L)
+                    )
                 } else {
-                    cancelLockPauseTimer()
-                    activeLockedSegmentEndMs = 0L
-                    resumePositionMs = player.currentPosition.toLong()
+                    cancelLoopBoundaryTimer()
                 }
-                resetLockPositionUntilStarted = false
             } catch (error: IllegalStateException) {
                 handleVideoFailure(
                     activeVideoUri ?: selectedVideoUri ?: return,
@@ -814,43 +739,6 @@ class DriftWallpaperService : WallpaperService() {
                     error
                 )
             }
-        }
-
-        private fun completeLockedSegment(player: MediaPlayer) {
-            if (videoPlayer !== player) return
-            val segmentEndMs = activeLockedSegmentEndMs
-            if (segmentEndMs <= 0L) {
-                cancelLockPauseTimer()
-                return
-            }
-
-            cancelLockPauseTimer()
-            try {
-                if (player.isPlaying) player.pause()
-            } catch (error: IllegalStateException) {
-                Log.w(TAG, "Could not pause the video at the lock-screen limit", error)
-            }
-
-            resumePositionMs = segmentEndMs
-            lockSegmentComplete = true
-            activeLockedSegmentEndMs = 0L
-            persistResumePosition(resumePositionMs)
-        }
-
-        private fun scheduleLockPause(player: MediaPlayer, delayMs: Long) {
-            cancelLockPauseTimer()
-            lockTimerPlayer = player
-            scheduledLockTimerGeneration = lockTimerGeneration
-            val safeDelayMs = delayMs.coerceAtLeast(1L)
-            lockPauseDeadlineUptimeMs = SystemClock.uptimeMillis() + safeDelayMs
-            handler.postDelayed(lockSegmentBoundaryCheck, safeDelayMs)
-        }
-
-        private fun cancelLockPauseTimer() {
-            handler.removeCallbacks(lockSegmentBoundaryCheck)
-            lockTimerPlayer = null
-            lockPauseDeadlineUptimeMs = 0L
-            lockTimerGeneration += 1L
         }
 
         private fun isPlayerPlaying(player: MediaPlayer): Boolean =
@@ -888,22 +776,14 @@ class DriftWallpaperService : WallpaperService() {
 
         private fun releaseVideoPlayer(savePosition: Boolean) {
             handler.removeCallbacks(deferredVideoRelease)
-            cancelLockPauseTimer()
+            cancelLoopBoundaryTimer()
             val player = videoPlayer ?: return
             if (
                 savePosition &&
-                !resetLockPositionUntilStarted &&
                 activeVideoUri == selectedVideoUri
             ) {
                 try {
-                    val currentPositionMs = player.currentPosition.toLong()
-                    val lockSegmentEnd = activeLockedSegmentEndMs
-                    if (lockSegmentEnd > 0L && currentPositionMs >= lockSegmentEnd) {
-                        resumePositionMs = lockSegmentEnd
-                        lockSegmentComplete = true
-                    } else {
-                        resumePositionMs = currentPositionMs
-                    }
+                    resumePositionMs = player.currentPosition.toLong().coerceAtLeast(0L)
                 } catch (_: IllegalStateException) {
                     // Keep the last known position if preparation had not completed.
                 }
@@ -913,11 +793,11 @@ class DriftWallpaperService : WallpaperService() {
             videoPlayer = null
             activeVideoUri = null
             videoSurfaceAttached = false
-            activeLockedSegmentEndMs = 0L
             playerPrepared = false
             seekInFlight = false
             desiredSeekPositionMs = null
             startAfterSeek = false
+            loopSeekPending = false
             try {
                 player.release()
             } catch (error: RuntimeException) {
@@ -1002,39 +882,15 @@ class DriftWallpaperService : WallpaperService() {
         const val VIDEO_DURATION_MS_KEY = "selected_video_duration_ms"
         const val VIDEO_RESUME_POSITION_MS_KEY = "video_resume_position_ms"
         const val BUILT_IN_ANIMATION_TIME_MS_KEY = "builtin_animation_time_ms"
-        const val LOCK_SPLIT_ENABLED_KEY = "lock_split_enabled"
-        const val LOCK_SEGMENT_TENTHS_KEY = "lock_segment_tenths"
-        private const val LEGACY_LOCK_SEGMENT_SECONDS_KEY = "lock_segment_seconds"
+        const val VIDEO_LOOP_ENABLED_KEY = "video_loop_enabled"
+        const val VIDEO_LOOP_START_TENTHS_KEY = "video_loop_start_tenths"
+        const val VIDEO_LOOP_END_TENTHS_KEY = "video_loop_end_tenths"
+        const val RESTART_VIDEO_ON_SCREEN_ON_KEY = "restart_video_on_screen_on"
 
         private const val TAG = "LumaDrift"
         private const val FRAME_INTERVAL_MS = 1_000L / 24L
         private const val VIDEO_PLAYER_RELEASE_DELAY_MS = 5_000L
         private const val MILLISECONDS_PER_TENTH = 100L
-        private const val DEFAULT_LOCK_SEGMENT_TENTHS = 50
-        private const val MIN_LOCK_SEGMENT_TENTHS = 1
-        private const val LEGACY_DEFAULT_LOCK_SEGMENT_SECONDS = 5
         private const val SEEK_TOLERANCE_MS = 80L
-
-        fun readSavedLockSegmentTenths(
-            preferences: android.content.SharedPreferences
-        ): Int {
-            if (preferences.contains(LOCK_SEGMENT_TENTHS_KEY)) {
-                return preferences.getInt(
-                    LOCK_SEGMENT_TENTHS_KEY,
-                    DEFAULT_LOCK_SEGMENT_TENTHS
-                ).coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS)
-            }
-
-            val legacySeconds = preferences.getInt(
-                LEGACY_LOCK_SEGMENT_SECONDS_KEY,
-                LEGACY_DEFAULT_LOCK_SEGMENT_SECONDS
-            ).coerceAtLeast(1)
-            val tenths = (legacySeconds.toLong() * 10L)
-                .coerceAtMost(Int.MAX_VALUE.toLong())
-                .toInt()
-                .coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS)
-            preferences.edit().putInt(LOCK_SEGMENT_TENTHS_KEY, tenths).apply()
-            return tenths
-        }
     }
 }

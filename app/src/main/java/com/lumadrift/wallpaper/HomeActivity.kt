@@ -26,14 +26,24 @@ class HomeActivity : Activity() {
     private lateinit var selectedVideoLabel: TextView
     private lateinit var clearVideoButton: Button
     private lateinit var videoPreview: VideoView
-    private lateinit var lockSplitSwitch: Switch
-    private lateinit var lockSegmentSeekBar: SeekBar
-    private lateinit var lockSegmentAmount: TextView
+    private lateinit var videoLoopEnabledSwitch: Switch
+    private lateinit var loopStartSeekBar: SeekBar
+    private lateinit var loopEndSeekBar: SeekBar
+    private lateinit var loopStartValue: TextView
+    private lateinit var loopEndValue: TextView
+    private lateinit var loopRangeSummary: TextView
+    private lateinit var loopRangeValidation: TextView
+    private lateinit var loopRangeTimeline: LoopRangeTimelineView
+    private lateinit var resetLoopRangeButton: Button
     private var previewUri: Uri? = null
     private var previewActive = false
     private var previewFailed = false
     private var metadataLoadingUri: Uri? = null
     private var metadataAttemptedUri: Uri? = null
+    private var loopControlsUpdating = false
+    private var loopDurationTenths = 0
+    private var loopStartTenths = 0
+    private var loopEndTenths = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -44,12 +54,23 @@ class HomeActivity : Activity() {
             DriftWallpaperService.PREFERENCES_NAME,
             MODE_PRIVATE
         )
+        preferences.edit()
+            .remove("lock_split_enabled")
+            .remove("lock_segment_tenths")
+            .remove("lock_segment_seconds")
+            .apply()
         selectedVideoLabel = findViewById(R.id.selectedVideoLabel)
         clearVideoButton = findViewById(R.id.clearVideoButton)
         videoPreview = findViewById(R.id.videoPreview)
-        lockSplitSwitch = findViewById(R.id.lockSplitSwitch)
-        lockSegmentSeekBar = findViewById(R.id.lockSegmentSeekBar)
-        lockSegmentAmount = findViewById(R.id.lockSegmentAmount)
+        videoLoopEnabledSwitch = findViewById(R.id.videoLoopEnabledSwitch)
+        loopStartSeekBar = findViewById(R.id.loopStartSeekBar)
+        loopEndSeekBar = findViewById(R.id.loopEndSeekBar)
+        loopStartValue = findViewById(R.id.loopStartValue)
+        loopEndValue = findViewById(R.id.loopEndValue)
+        loopRangeSummary = findViewById(R.id.loopRangeSummary)
+        loopRangeValidation = findViewById(R.id.loopRangeValidation)
+        loopRangeTimeline = findViewById(R.id.loopRangeTimeline)
+        resetLoopRangeButton = findViewById(R.id.resetLoopRangeButton)
 
         videoPreview.setOnPreparedListener { player ->
             player.isLooping = true
@@ -79,49 +100,23 @@ class HomeActivity : Activity() {
             preview.setAnimationEnabled(enabled)
         }
 
-        lockSplitSwitch.isChecked = preferences.getBoolean(
-            DriftWallpaperService.LOCK_SPLIT_ENABLED_KEY,
+        videoLoopEnabledSwitch.isChecked = preferences.getBoolean(
+            DriftWallpaperService.VIDEO_LOOP_ENABLED_KEY,
             false
         )
-        lockSplitSwitch.setOnCheckedChangeListener { _, enabled ->
+        videoLoopEnabledSwitch.setOnCheckedChangeListener { _, enabled ->
+            if (loopControlsUpdating) return@setOnCheckedChangeListener
             preferences.edit()
-                .putBoolean(DriftWallpaperService.LOCK_SPLIT_ENABLED_KEY, enabled)
+                .putBoolean(DriftWallpaperService.VIDEO_LOOP_ENABLED_KEY, enabled)
                 .apply()
-            updateLockPlaybackControls(
+            updateVideoLoopControls(
                 preferences.getString(DriftWallpaperService.VIDEO_URI_KEY, null)
                     ?.let { Uri.parse(it) }
             )
         }
-        lockSegmentSeekBar.progress = DriftWallpaperService
-            .readSavedLockSegmentTenths(preferences)
-            .coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS)
-        lockSegmentSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (!fromUser) return
-                val safeProgress = progress.coerceIn(
-                    MIN_LOCK_SEGMENT_TENTHS,
-                    (seekBar?.max ?: MIN_LOCK_SEGMENT_TENTHS).coerceAtLeast(
-                        MIN_LOCK_SEGMENT_TENTHS
-                    )
-                )
-                if (safeProgress != progress) seekBar?.progress = safeProgress
-                updateLockSegmentAmount()
-            }
-
-            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                preferences.edit()
-                    .putInt(
-                        DriftWallpaperService.LOCK_SEGMENT_TENTHS_KEY,
-                        lockSegmentSeekBar.progress.coerceIn(
-                            MIN_LOCK_SEGMENT_TENTHS,
-                            lockSegmentSeekBar.max.coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS)
-                        )
-                    )
-                    .apply()
-            }
-        })
+        loopStartSeekBar.setOnSeekBarChangeListener(loopRangeSeekListener(isStart = true))
+        loopEndSeekBar.setOnSeekBarChangeListener(loopRangeSeekListener(isStart = false))
+        resetLoopRangeButton.setOnClickListener { resetVideoLoopRange() }
 
         findViewById<Button>(R.id.setWallpaperButton).setOnClickListener {
             openWallpaperPicker()
@@ -135,6 +130,8 @@ class HomeActivity : Activity() {
                 .remove(DriftWallpaperService.VIDEO_URI_KEY)
                 .remove(DriftWallpaperService.VIDEO_NAME_KEY)
                 .remove(DriftWallpaperService.VIDEO_DURATION_MS_KEY)
+                .remove(DriftWallpaperService.VIDEO_LOOP_START_TENTHS_KEY)
+                .remove(DriftWallpaperService.VIDEO_LOOP_END_TENTHS_KEY)
                 .apply()
             metadataAttemptedUri = null
             metadataLoadingUri = null
@@ -231,11 +228,18 @@ class HomeActivity : Activity() {
 
         releaseStoredVideoGrant(except = uri)
         val displayName = getDisplayName(uri)
-        preferences.edit()
+        val videoChanged = preferences
+            .getString(DriftWallpaperService.VIDEO_URI_KEY, null) != uri.toString()
+        val videoPreferences = preferences.edit()
             .putString(DriftWallpaperService.VIDEO_URI_KEY, uri.toString())
             .putString(DriftWallpaperService.VIDEO_NAME_KEY, displayName)
             .remove(DriftWallpaperService.VIDEO_DURATION_MS_KEY)
-            .apply()
+        if (videoChanged) {
+            videoPreferences
+                .remove(DriftWallpaperService.VIDEO_LOOP_START_TENTHS_KEY)
+                .remove(DriftWallpaperService.VIDEO_LOOP_END_TENTHS_KEY)
+        }
+        videoPreferences.apply()
         metadataAttemptedUri = null
         refreshVideoSelection()
         Toast.makeText(this, R.string.video_selected, Toast.LENGTH_SHORT).show()
@@ -268,7 +272,7 @@ class HomeActivity : Activity() {
             metadataAttemptedUri = null
             metadataLoadingUri = null
             syncVideoPreview(null)
-            updateLockPlaybackControls(null)
+            updateVideoLoopControls(null)
             return
         }
 
@@ -283,7 +287,7 @@ class HomeActivity : Activity() {
         selectedVideoLabel.text = getString(R.string.selected_video_format, displayName)
         clearVideoButton.visibility = View.VISIBLE
         findViewById<TextView>(R.id.previewCaption).setText(R.string.video_preview_caption)
-        updateLockPlaybackControls(uri)
+        updateVideoLoopControls(uri)
     }
 
     private fun syncVideoPreview(uri: Uri?) {
@@ -316,7 +320,7 @@ class HomeActivity : Activity() {
     private fun loadVideoDuration(uri: Uri) {
         metadataAttemptedUri = uri
         metadataLoadingUri = uri
-        updateLockPlaybackControls(uri)
+        updateVideoLoopControls(uri)
 
         Thread({
             var durationMs: Long? = null
@@ -349,70 +353,181 @@ class HomeActivity : Activity() {
                         .putLong(DriftWallpaperService.VIDEO_DURATION_MS_KEY, loadedDuration)
                         .apply()
                 }
-                updateLockPlaybackControls(uri)
+                updateVideoLoopControls(uri)
             }
         }, "video-metadata-reader").start()
     }
 
-    private fun updateLockPlaybackControls(uri: Uri?) {
-        val controls = findViewById<View>(R.id.lockPlaybackControls)
-        controls.visibility = if (uri == null) View.GONE else View.VISIBLE
-        if (uri == null) return
+    private fun loopRangeSeekListener(isStart: Boolean) =
+        object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (!fromUser || loopControlsUpdating || loopDurationTenths < 1) return
+                loopControlsUpdating = true
+                if (isStart) {
+                    loopStartTenths = progress.coerceIn(0, loopDurationTenths - 1)
+                    if (loopEndTenths <= loopStartTenths) {
+                        loopEndTenths = loopStartTenths + 1
+                    }
+                } else {
+                    loopEndTenths = progress.coerceIn(1, loopDurationTenths)
+                    if (loopEndTenths <= loopStartTenths) {
+                        loopEndTenths = loopStartTenths + 1
+                    }
+                }
+                loopStartSeekBar.progress = loopStartTenths
+                loopEndSeekBar.progress = loopEndTenths
+                loopControlsUpdating = false
+                updateLoopRangeLabels()
+            }
 
-        val durationMs = preferences.getLong(DriftWallpaperService.VIDEO_DURATION_MS_KEY, 0L)
-        val durationKnown = durationMs > 0L
-        val splitEnabled = preferences.getBoolean(
-            DriftWallpaperService.LOCK_SPLIT_ENABLED_KEY,
-            false
-        )
-        if (lockSplitSwitch.isChecked != splitEnabled) {
-            lockSplitSwitch.isChecked = splitEnabled
-        }
-        lockSplitSwitch.isEnabled = durationKnown
-        if (durationKnown) {
-            val maxTenths = (durationMs / MILLISECONDS_PER_TENTH)
-                .coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS.toLong())
-                .coerceAtMost(Int.MAX_VALUE.toLong())
-                .toInt()
-            lockSegmentSeekBar.max = maxTenths
-            val configuredTenths = DriftWallpaperService
-                .readSavedLockSegmentTenths(preferences)
-            val safeTenths = configuredTenths.coerceIn(
-                MIN_LOCK_SEGMENT_TENTHS,
-                maxTenths
-            )
-            lockSegmentSeekBar.progress = safeTenths
-            if (configuredTenths != safeTenths) {
-                preferences.edit()
-                    .putInt(DriftWallpaperService.LOCK_SEGMENT_TENTHS_KEY, safeTenths)
-                    .apply()
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                persistVideoLoopRange()
             }
         }
-        lockSegmentSeekBar.isEnabled = durationKnown && splitEnabled
 
-        when {
-            durationKnown -> updateLockSegmentAmount()
-            metadataLoadingUri == uri -> lockSegmentAmount.setText(R.string.lock_segment_loading)
-            else -> lockSegmentAmount.setText(R.string.lock_segment_unknown)
+    private fun updateVideoLoopControls(uri: Uri?) {
+        val controls = findViewById<View>(R.id.videoLoopControls)
+        controls.visibility = if (uri == null) View.GONE else View.VISIBLE
+        if (uri == null) {
+            loopDurationTenths = 0
+            loopRangeValidation.visibility = View.GONE
+            return
+        }
+
+        val durationMs = preferences.getLong(DriftWallpaperService.VIDEO_DURATION_MS_KEY, 0L)
+        loopDurationTenths = (durationMs / MILLISECONDS_PER_TENTH)
+            .coerceAtMost(Int.MAX_VALUE.toLong())
+            .toInt()
+        if (loopDurationTenths < 1) {
+            val durationMessage = when {
+                durationMs > 0L -> getString(R.string.loop_range_too_short)
+                metadataLoadingUri == uri -> getString(R.string.loop_range_loading)
+                else -> getString(R.string.loop_range_unknown)
+            }
+            videoLoopEnabledSwitch.isEnabled = false
+            loopStartSeekBar.isEnabled = false
+            loopEndSeekBar.isEnabled = false
+            resetLoopRangeButton.isEnabled = false
+            loopRangeValidation.text = durationMessage
+            loopRangeValidation.visibility = View.VISIBLE
+            loopRangeSummary.text = getString(R.string.loop_range_unavailable)
+            loopStartValue.text = getString(R.string.loop_range_dash)
+            loopEndValue.text = getString(R.string.loop_range_dash)
+            loopRangeTimeline.setRange(0, 0, 0)
+            return
+        }
+
+        val storedStart = preferences.getInt(
+            DriftWallpaperService.VIDEO_LOOP_START_TENTHS_KEY,
+            0
+        )
+        val storedEnd = preferences.getInt(
+            DriftWallpaperService.VIDEO_LOOP_END_TENTHS_KEY,
+            loopDurationTenths
+        )
+        var safeStart = storedStart.coerceIn(0, loopDurationTenths - 1)
+        var safeEnd = storedEnd.coerceIn(1, loopDurationTenths)
+        if (safeEnd <= safeStart) {
+            if (safeStart < loopDurationTenths - 1) {
+                safeEnd = safeStart + 1
+            } else {
+                safeStart = safeEnd - 1
+            }
+        }
+        val adjusted = safeStart != storedStart || safeEnd != storedEnd
+        loopStartTenths = safeStart
+        loopEndTenths = safeEnd
+        loopControlsUpdating = true
+        loopStartSeekBar.max = (loopDurationTenths - 1).coerceAtLeast(0)
+        loopEndSeekBar.max = loopDurationTenths
+        loopStartSeekBar.progress = loopStartTenths
+        loopEndSeekBar.progress = loopEndTenths
+        val loopEnabled = preferences.getBoolean(
+            DriftWallpaperService.VIDEO_LOOP_ENABLED_KEY,
+            false
+        )
+        videoLoopEnabledSwitch.isChecked = loopEnabled
+        videoLoopEnabledSwitch.isEnabled = true
+        val rangeEnabled = loopEnabled && loopDurationTenths > 0
+        loopStartSeekBar.isEnabled = rangeEnabled
+        loopEndSeekBar.isEnabled = rangeEnabled
+        resetLoopRangeButton.isEnabled = true
+        loopControlsUpdating = false
+        updateLoopRangeLabels()
+
+        loopRangeValidation.text = when {
+            adjusted -> getString(R.string.loop_range_adjusted)
+            !isValidLoopRange() -> getString(R.string.loop_range_invalid)
+            else -> ""
+        }
+        loopRangeValidation.visibility =
+            if (loopRangeValidation.text.isEmpty()) View.GONE else View.VISIBLE
+
+        if (
+            adjusted ||
+            !preferences.contains(DriftWallpaperService.VIDEO_LOOP_START_TENTHS_KEY) ||
+            !preferences.contains(DriftWallpaperService.VIDEO_LOOP_END_TENTHS_KEY)
+        ) {
+            persistVideoLoopRange()
         }
     }
 
-    private fun updateLockSegmentAmount() {
-        val durationMs = preferences.getLong(DriftWallpaperService.VIDEO_DURATION_MS_KEY, 0L)
-        if (durationMs <= 0L) return
+    private fun updateLoopRangeLabels() {
+        loopStartValue.text = getString(
+            R.string.loop_range_time,
+            formatTenthsAsSeconds(loopStartTenths)
+        )
+        loopEndValue.text = getString(
+            R.string.loop_range_time,
+            formatTenthsAsSeconds(loopEndTenths)
+        )
+        loopRangeSummary.text = getString(
+            R.string.loop_range_summary,
+            formatTenthsAsSeconds(loopStartTenths),
+            formatTenthsAsSeconds(loopEndTenths)
+        )
+        loopRangeTimeline.setRange(
+            loopStartTenths,
+            loopEndTenths,
+            loopDurationTenths
+        )
+        loopRangeTimeline.contentDescription = getString(
+            R.string.loop_range_timeline_accessibility,
+            formatTenthsAsSeconds(loopStartTenths),
+            formatTenthsAsSeconds(loopEndTenths)
+        )
+        if (isValidLoopRange()) {
+            loopRangeValidation.visibility = View.GONE
+            loopRangeValidation.text = ""
+        }
+    }
 
-        val maxTenths = (durationMs / MILLISECONDS_PER_TENTH)
-            .coerceAtLeast(MIN_LOCK_SEGMENT_TENTHS.toLong())
-            .coerceAtMost(Int.MAX_VALUE.toLong())
-            .toInt()
-        val tenths = lockSegmentSeekBar.progress.coerceIn(
-            MIN_LOCK_SEGMENT_TENTHS,
-            maxTenths
-        )
-        lockSegmentAmount.text = getString(
-            R.string.lock_segment_amount,
-            formatTenthsAsSeconds(tenths)
-        )
+    private fun isValidLoopRange(): Boolean =
+        loopDurationTenths > 0 &&
+            loopStartTenths >= 0 &&
+            loopStartTenths < loopEndTenths &&
+            loopEndTenths <= loopDurationTenths
+
+    private fun persistVideoLoopRange() {
+        if (!isValidLoopRange()) return
+        preferences.edit()
+            .putInt(DriftWallpaperService.VIDEO_LOOP_START_TENTHS_KEY, loopStartTenths)
+            .putInt(DriftWallpaperService.VIDEO_LOOP_END_TENTHS_KEY, loopEndTenths)
+            .apply()
+    }
+
+    private fun resetVideoLoopRange() {
+        if (loopDurationTenths < 1) return
+        loopStartTenths = 0
+        loopEndTenths = loopDurationTenths
+        loopControlsUpdating = true
+        loopStartSeekBar.progress = loopStartTenths
+        loopEndSeekBar.progress = loopEndTenths
+        loopControlsUpdating = false
+        persistVideoLoopRange()
+        updateLoopRangeLabels()
     }
 
     private fun formatTenthsAsSeconds(tenths: Int): String =
@@ -442,7 +557,6 @@ class HomeActivity : Activity() {
     companion object {
         private const val REQUEST_VIDEO = 108
         private const val TAG = "LumaDriftHome"
-        private const val MIN_LOCK_SEGMENT_TENTHS = 1
         private const val MILLISECONDS_PER_TENTH = 100L
     }
 }

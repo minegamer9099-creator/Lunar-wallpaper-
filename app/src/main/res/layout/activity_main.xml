@@ -100,7 +100,7 @@
             android:textSize="12sp" />
 
         <LinearLayout
-            android:id="@+id/lockPlaybackControls"
+            android:id="@+id/videoLoopControls"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="18dp"
@@ -110,45 +110,116 @@
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="@string/lock_playback_title"
+                android:text="@string/video_loop_range_title"
                 android:textColor="@color/text_primary"
                 android:textSize="17sp"
                 android:textStyle="bold" />
 
             <Switch
-                android:id="@+id/lockSplitSwitch"
+                android:id="@+id/videoLoopEnabledSwitch"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:checked="false"
-                android:text="@string/lock_split_switch"
+                android:text="@string/video_loop_enabled"
                 android:textColor="@color/text_primary"
                 android:textSize="14sp" />
 
             <TextView
-                android:id="@+id/lockPlaybackDescription"
+                android:id="@+id/loopRangeDescription"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="5dp"
-                android:text="@string/lock_split_description"
+                android:text="@string/video_loop_description"
                 android:textColor="@color/text_secondary"
                 android:textSize="13sp" />
 
             <TextView
-                android:id="@+id/lockSegmentAmount"
+                android:id="@+id/loopRangeSummary"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
                 android:textColor="@color/accent"
                 android:textSize="13sp"
-                android:textStyle="bold" />
+                android:textStyle="bold"
+                android:text="@string/loop_range_summary_default" />
+
+            <com.lumadrift.wallpaper.LoopRangeTimelineView
+                android:id="@+id/loopRangeTimeline"
+                android:layout_width="match_parent"
+                android:layout_height="30dp"
+                android:layout_marginTop="5dp"
+                android:contentDescription="@string/loop_range_timeline_description" />
+
+            <TextView
+                android:id="@+id/loopStartLabel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/loop_start_label"
+                android:textColor="@color/text_primary"
+                android:textSize="13sp" />
 
             <SeekBar
-                android:id="@+id/lockSegmentSeekBar"
+                android:id="@+id/loopStartSeekBar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="99"
+                android:progress="0" />
+
+            <TextView
+                android:id="@+id/loopStartValue"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:text="@string/loop_range_time_default"
+                android:textColor="@color/accent"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/loopEndLabel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/loop_end_label"
+                android:textColor="@color/text_primary"
+                android:textSize="13sp" />
+
+            <SeekBar
+                android:id="@+id/loopEndSeekBar"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:max="100"
-                android:progress="50" />
+                android:progress="100" />
+
+            <TextView
+                android:id="@+id/loopEndValue"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:text="@string/loop_range_time_default"
+                android:textColor="@color/accent"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/loopRangeValidation"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/resetLoopRangeButton"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:layout_marginTop="6dp"
+                android:backgroundTint="@color/control_background"
+                android:text="@string/reset_loop_range"
+                android:textAllCaps="false"
+                android:textColor="@color/text_primary"
+                android:textSize="13sp" />
         </LinearLayout>
 
         <Button
