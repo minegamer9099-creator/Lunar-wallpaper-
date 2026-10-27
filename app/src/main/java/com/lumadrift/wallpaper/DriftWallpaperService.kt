@@ -331,7 +331,7 @@ class DriftWallpaperService : WallpaperService() {
             updateAnimationClock()
             if (!canDraw() || !screenIsOn) {
                 pauseVideoPlayerForTransition(
-                    detachSurface = !surfaceAvailable || !screenIsOn
+                    detachSurface = !surfaceAvailable || !surfaceHolder.surface.isValid
                 )
                 scheduleDeferredVideoReleaseIfNeeded()
                 return
@@ -435,8 +435,9 @@ class DriftWallpaperService : WallpaperService() {
         }
 
         private fun attachVideoSurface(player: MediaPlayer): Boolean {
-            if (videoSurfaceAttached) return true
             val surface = surfaceHolder.surface
+            if (videoSurfaceAttached && surface.isValid) return true
+            videoSurfaceAttached = false
             if (!surface.isValid) return false
 
             return try {
