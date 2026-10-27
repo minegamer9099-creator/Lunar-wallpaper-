@@ -59,6 +59,7 @@ class DriftWallpaperService : WallpaperService() {
             RESTART_VIDEO_ON_SCREEN_ON_KEY,
             false
         ) || !screenIsOn
+        private var restartSeekReady = false
         private var playerPrepared = false
         private var seekInFlight = false
         private var desiredSeekPositionMs: Long? = null
@@ -132,15 +133,30 @@ class DriftWallpaperService : WallpaperService() {
         private fun handleScreenOff() {
             screenIsOn = false
             restartAtNextScreenOn = true
+            restartSeekReady = false
             preferences.edit()
                 .putBoolean(RESTART_VIDEO_ON_SCREEN_ON_KEY, true)
                 .apply()
             updateRendering()
+            prepareRestartWhileScreenOff()
         }
 
         private fun handleScreenOn() {
             screenIsOn = true
             updateRendering()
+        }
+
+        private fun prepareRestartWhileScreenOff() {
+            val player = videoPlayer ?: return
+            if (!playerPrepared || activeVideoUri != selectedVideoUri) return
+
+            // Queue the required restart seek while the display is off, not on the lock screen.
+            requestPlaybackPosition(
+                player,
+                0L,
+                shouldStart = false,
+                forceSeek = true
+            )
         }
 
         private fun refreshScreenStateFromPowerManager() {
@@ -285,14 +301,20 @@ class DriftWallpaperService : WallpaperService() {
             if (refreshScreenState) refreshScreenStateFromPowerManager()
             updateAnimationClock()
             if (!canDraw() || !screenIsOn) {
-                pauseVideoPlayerForTransition(detachSurface = !surfaceAvailable)
+                pauseVideoPlayerForTransition(
+                    detachSurface = !surfaceAvailable || !screenIsOn
+                )
                 scheduleDeferredVideoReleaseIfNeeded()
                 return
             }
 
+            val videoUri = selectedVideoUri
             val restartPlayback = restartAtNextScreenOn
+            val restartPositionReady = restartPlayback && restartSeekReady
             if (restartPlayback) {
+                videoPlayer?.let { pauseVideoPlayerForTransition(detachSurface = true) }
                 restartAtNextScreenOn = false
+                restartSeekReady = false
                 resumePositionMs = 0L
                 persistResumePosition(0L)
                 preferences.edit()
@@ -300,23 +322,28 @@ class DriftWallpaperService : WallpaperService() {
                     .apply()
                 loopSeekPending = false
                 cancelLoopBoundaryTimer()
+                if (videoUri != null && videoUri != failedVideoUri) {
+                    // Replace the Surface's retained pre-lock buffer before video output is reattached.
+                    drawFrame()
+                }
             }
 
-            val videoUri = selectedVideoUri
             if (videoUri != null && videoUri != failedVideoUri) {
                 if (activeVideoUri == videoUri && videoPlayer != null) {
                     val player = videoPlayer ?: return
-                    if (!attachVideoSurface(player)) return
-                    if (
-                        playerPrepared &&
-                        (restartPlayback || !isPlayerPlaying(player))
-                    ) {
-                        requestPlaybackPosition(
-                            player,
-                            if (restartPlayback) 0L else resumePositionMs,
-                            shouldStart = true,
-                            forceSeek = restartPlayback
-                        )
+                    if (playerPrepared && (restartPlayback || !isPlayerPlaying(player))) {
+                        if (restartPositionReady) {
+                            startPreparedPlayer(player)
+                        } else {
+                            requestPlaybackPosition(
+                                player,
+                                if (restartPlayback) 0L else resumePositionMs,
+                                shouldStart = true,
+                                forceSeek = restartPlayback
+                            )
+                        }
+                    } else if (!restartPlayback && !attachVideoSurface(player)) {
+                        return
                     }
                     return
                 }
@@ -505,6 +532,13 @@ class DriftWallpaperService : WallpaperService() {
 
                     desiredSeekPositionMs = null
                     resumePositionMs = desiredPosition
+                    if (
+                        desiredPosition == 0L &&
+                        restartAtNextScreenOn &&
+                        !screenIsOn
+                    ) {
+                        restartSeekReady = true
+                    }
                     val shouldStart = startAfterSeek
                     startAfterSeek = false
                     if (shouldStart) startPreparedPlayer(seekedPlayer)
@@ -719,6 +753,7 @@ class DriftWallpaperService : WallpaperService() {
                     }
                 }
 
+                if (!attachVideoSurface(player)) return
                 if (!player.isPlaying) player.start()
                 val currentPositionMs = player.currentPosition.toLong().coerceAtLeast(0L)
                 resumePositionMs = currentPositionMs
@@ -777,6 +812,7 @@ class DriftWallpaperService : WallpaperService() {
         private fun releaseVideoPlayer(savePosition: Boolean) {
             handler.removeCallbacks(deferredVideoRelease)
             cancelLoopBoundaryTimer()
+            restartSeekReady = false
             val player = videoPlayer ?: return
             if (
                 savePosition &&
