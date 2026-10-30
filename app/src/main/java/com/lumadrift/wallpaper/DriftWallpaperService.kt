@@ -491,6 +491,7 @@ class DriftWallpaperService : WallpaperService() {
                     }
 
                     playerPrepared = true
+                    disableAudioTracks(preparedPlayer)
                     val actualDurationMs = preparedPlayer.duration.toLong()
                     if (actualDurationMs > 0L) {
                         videoDurationMs = actualDurationMs
@@ -792,6 +793,22 @@ class DriftWallpaperService : WallpaperService() {
             } catch (_: IllegalStateException) {
                 false
             }
+
+        private fun disableAudioTracks(player: MediaPlayer) {
+            try {
+                player.trackInfo.forEachIndexed { index, trackInfo ->
+                    if (
+                        trackInfo.trackType ==
+                        MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_AUDIO
+                    ) {
+                        player.deselectTrack(index)
+                    }
+                }
+            } catch (error: RuntimeException) {
+                // The wallpaper is muted already; keep playback if an OEM player rejects track selection.
+                Log.w(TAG, "Could not disable the muted wallpaper audio track", error)
+            }
+        }
 
         private fun seekTo(player: MediaPlayer, positionMs: Long) {
             val safePosition = positionMs.coerceAtLeast(0L)
